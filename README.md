@@ -10,9 +10,9 @@ No screen recorder, no Figma, no After Effects, no mockup PNGs. Just the
 [Revyl CLI](https://docs.revyl.ai) + `ffmpeg`, or a local iOS simulator (see
 [`local`](#local-simulator-local) mode).
 
-![Ubert — book a ride, framed and looping](demo/ubert-book-ride.gif)
+![Ubert, book a ride, framed and looping](demo/ubert-book-ride.gif)
 
-> *Generated from [`flows/ubert.yaml`](flows/ubert.yaml) — Home → search → "Times Square" → live ride options — in one command.*
+> *Generated from [`flows/ubert.yaml`](flows/ubert.yaml), Home → search → "Times Square" → live ride options, in one command.*
 
 ---
 
@@ -29,18 +29,18 @@ a small Python CLI orchestrating `revyl device` commands.
 
 ## How it works
 
-1. **Run** — starts a cloud device session and walks your flow
+1. **Run**: starts a device session and walks your flow
    (`revyl device tap/type/swipe/navigate/instruction …`).
-2. **Capture** — grabs a screenshot at every UI state you mark.
-3. **Frame** — composites each screenshot into a pristine, asset-free phone
-   mockup (rounded screen, thin bezel, Dynamic Island / notch / hole-punch,
-   side buttons, soft drop shadow) on a clean background.
-4. **Loop** — builds a smooth timeline (per-state holds + crossfade tweens +
+2. **Capture**: grabs a screenshot at every UI state you mark.
+3. **Frame**: composites each screenshot into a pristine, asset-free phone
+   mockup (rounded screen, thin bezel, side buttons, soft drop shadow) on a
+   clean background.
+4. **Loop**: builds a smooth timeline (per-state holds + crossfade tweens +
    a seamless crossfade from the last state back to the first) and encodes a
    high-quality GIF (ffmpeg `palettegen`/`paletteuse`) plus an MP4.
 
 > The capture primitive is `revyl device screenshot`, so the GIF is a polished
-> **state-to-state** loop — one frame per UI state, held and crossfaded — not a
+> **state-to-state** loop, one frame per UI state, held and crossfaded, not a
 > raw 60fps capture. That's exactly the look most good README/tweet GIFs have.
 
 ## Install
@@ -76,7 +76,7 @@ out/search-and-play/
   seq/           # the rendered timeline (held + crossfaded frames)
   search-and-play.gif
   search-and-play.mp4
-  preview.html   # a self-contained viewer — opens automatically in a TTY
+  preview.html   # a self-contained viewer, opens automatically in a TTY
 ```
 
 Every run compiles a **`preview.html`** next to the outputs (the GIF looping +
@@ -86,8 +86,8 @@ the MP4 autoplaying, side by side) and opens it in your browser. Pass
 ### Iterate for free with `--dry-run`
 
 The expensive part is the cloud device. Once a run has captured
-`out/<name>/frames/`, you can re-render the GIF as many times as you like —
-tweaking the frame color, background, hold timing, crossfade, etc. — **without
+`out/<name>/frames/`, you can re-render the GIF as many times as you like,
+tweaking the frame color, background, hold timing, crossfade, etc., **without
 touching a device**:
 
 ```bash
@@ -165,7 +165,7 @@ steps:
 
 Each step has **one** action key plus optional control keys
 (`capture`, `hold`, `label`, `settle`). Targets are natural language
-(`target:`) — grounded on the live UI by the Revyl agent — or coordinates
+(`target:`), grounded on the live UI by the Revyl agent, or coordinates
 (`x:` / `y:`).
 
 | Action | Example |
@@ -189,11 +189,11 @@ Each step has **one** action key plus optional control keys
 
 ### Control keys
 
-- **`capture`** *(default `true`)* — capture a frame after this step. Set
+- **`capture`** *(default `true`)*: capture a frame after this step. Set
   `false` on setup steps you don't want in the GIF.
-- **`hold`** — seconds to hold this state in the loop (overrides `output.hold`).
-- **`label`** — a name shown in the run log and used for the frame filename.
-- **`settle`** — seconds to wait after the action before the screenshot
+- **`hold`**: seconds to hold this state in the loop (overrides `output.hold`).
+- **`label`**: a name shown in the run log and used for the frame filename.
+- **`settle`**: seconds to wait after the action before the screenshot
   (overrides `capture.settle`).
 
 ## CLI overrides
@@ -219,4 +219,4 @@ pairs nicely with `--dry-run`:
 
 ## License
 
-MIT — fork it, ship it.
+MIT, fork it, ship it.
