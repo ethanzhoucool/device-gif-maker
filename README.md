@@ -7,7 +7,8 @@ seamlessly-looping GIF (and an MP4) of the flow running on a **cloud
 device**  framed in a clean phone mockup, ready for a README or a tweet.
 
 No screen recorder, no Figma, no After Effects, no mockup PNGs. Just the
-[Revyl CLI](https://docs.revyl.ai) + `ffmpeg`.
+[Revyl CLI](https://docs.revyl.ai) + `ffmpeg`, or a local iOS simulator (see
+[`local`](#local-simulator-local) mode).
 
 ![Ubert — book a ride, framed and looping](demo/ubert-book-ride.gif)
 
@@ -62,6 +63,9 @@ ln -s "$PWD/revyl-gif" /usr/local/bin/revyl-gif
 revyl-gif flows/example.yaml                  # full run on a fresh cloud device
 revyl-gif flows/example.yaml --attach <id>    # reuse a session you already have
 revyl-gif flows/example.yaml --dry-run        # re-render from captured frames only
+
+revyl-gif local flows/example.yaml            # run on a booted iOS simulator
+revyl-gif local --manual                      # local sim: press Enter to grab each screen
 ```
 
 Outputs land in `out/<flow-name>/`:
@@ -93,6 +97,20 @@ revyl-gif flows/example.yaml --dry-run --color silver --background midnight --ho
 Per-state holds and labels are restored from the capture's
 `frames/manifest.json`, so a re-render's timing matches the live run. Pass an
 explicit `--hold` to flatten every state to a single duration instead.
+
+### Local simulator (`local`)
+
+Prefix the command with `local` to drive a booted iOS simulator via `xcrun simctl`, no Revyl account needed.
+
+```bash
+revyl-gif local --manual                 # drive the sim yourself, press Enter per screen
+revyl-gif local flows/my-flow.yaml       # run a flow (see limits below)
+```
+
+- **`--manual`** is the simplest path: you tap through the sim, it grabs a screenshot each time you press Enter, then frames and encodes. Works for any flow, no extra tools.
+- **Flow-driven local** runs `navigate` (deep link), `launch`, `wait`, and `kill_app` via `simctl`. Coordinate `tap`/`type`/`drag` need [`idb`](https://fbidb.io) installed.
+- Natural-language `target:` and `instruction` are cloud-only (no on-device grounding locally), so use `x`/`y` coords or `--manual`.
+- Needs a booted simulator (Xcode + `xcrun simctl`). Set `app.bundle_id` (and optionally `app.app_path` to install a `.app`) in the flow to auto-launch.
 
 ## Flow spec
 
@@ -189,13 +207,15 @@ pairs nicely with `--dry-run`:
 --fps <n>  --hold <s>  --xfade <s>
 --no-shadow  --pingpong  --no-loop  --no-gif  --no-mp4
 --attach <session-id>  --keep-session  --timeout <s>  --out <dir>
+--open / --no-open   --manual          (prefix with `local` to use a simulator)
 ```
 
 ## Requirements
 
-- [Revyl CLI](https://docs.revyl.ai), authenticated (`revyl auth login`)
 - `ffmpeg` on your PATH
 - Python 3.9+ with `Pillow` and `PyYAML`
+- Cloud mode: the [Revyl CLI](https://docs.revyl.ai), authenticated (`revyl auth login`)
+- Local mode: Xcode / `xcrun simctl` with a booted simulator; [`idb`](https://fbidb.io) only for automated taps (not needed for `--manual`)
 
 ## License
 

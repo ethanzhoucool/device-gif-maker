@@ -1,8 +1,9 @@
 """Pristine, asset-free device-frame compositor.
 
 Takes a raw device screenshot and renders it inside a clean phone mockup
-(rounded screen, thin bezel, Dynamic Island / notch / hole-punch, side
-buttons, soft drop shadow) on a configurable background.
+(rounded screen, thin bezel, side buttons, soft drop shadow) on a configurable
+background. The screenshot already contains the real status bar / Dynamic
+Island / hole-punch, so the frame deliberately does not draw its own.
 
 No external mockup PNGs required -- the frame is drawn programmatically and
 supersampled for crisp anti-aliased edges, so it stays sharp at any width and
@@ -19,17 +20,18 @@ SS = 2
 
 # --- Geometry, all expressed as fractions of the (supersampled) screen width ---
 BEZEL_FRAC = 0.034           # thickness of the bezel ring around the screen
-SCREEN_RADIUS_FRAC = 0.135   # corner radius of the screen glass
 MARGIN_FRAC = 0.12           # padding (per side) between device and canvas edge
 EDGE_WIDTH_FRAC = 0.004      # rim-highlight outline thickness
 
-# Notch / island / camera, as fractions of screen width (w) unless noted.
-ISLAND_W_FRAC = 0.30
-ISLAND_H_FRAC = 0.083
-ISLAND_TOP_FRAC = 0.022      # offset from top of screen, as fraction of screen *height*
-NOTCH_W_FRAC = 0.44
-NOTCH_H_FRAC = 0.058
-HOLE_R_FRAC = 0.020          # android hole-punch radius
+# Screen-glass corner radius by style (fraction of screen width). The status
+# bar / island / hole-punch are already baked into the screenshot, so the
+# frame never draws them -- style only controls how rounded the corners are.
+SCREEN_RADIUS_FRAC = {
+    "iphone-pro": 0.135,
+    "iphone": 0.135,
+    "android": 0.075,
+}
+DEFAULT_SCREEN_RADIUS_FRAC = 0.135
 
 # Side buttons, as fractions of device height.
 BTN_POWER_TOP_FRAC = 0.26
@@ -44,31 +46,26 @@ SHADOW_OFFSET_FRAC = 0.020   # of device height
 SHADOW_ALPHA = 78
 
 COLOR_SCHEMES = {
-    # bezel = body color, edge = thin rim highlight, button = side-button color,
-    # island = notch/island/hole fill.
+    # bezel = body color, edge = thin rim highlight, button = side-button color.
     "black": {
         "bezel": (12, 12, 14, 255),
         "edge": (52, 52, 58, 255),
         "button": (26, 26, 30, 255),
-        "island": (3, 3, 4, 255),
     },
     "graphite": {
         "bezel": (38, 39, 43, 255),
         "edge": (90, 91, 98, 255),
         "button": (28, 29, 33, 255),
-        "island": (8, 8, 10, 255),
     },
     "silver": {
         "bezel": (216, 217, 221, 255),
         "edge": (255, 255, 255, 255),
         "button": (186, 187, 193, 255),
-        "island": (18, 18, 20, 255),
     },
     "white": {
         "bezel": (244, 244, 247, 255),
         "edge": (255, 255, 255, 255),
         "button": (208, 208, 214, 255),
-        "island": (18, 18, 20, 255),
     },
 }
 
@@ -168,7 +165,8 @@ def build_device_frame(
     screen = src.resize((sw, sh), Image.LANCZOS)
 
     bezel = max(2, int(round(BEZEL_FRAC * sw)))
-    screen_radius = int(round(SCREEN_RADIUS_FRAC * sw))
+    radius_frac = SCREEN_RADIUS_FRAC.get(style, DEFAULT_SCREEN_RADIUS_FRAC)
+    screen_radius = int(round(radius_frac * sw))
     outer_radius = screen_radius + bezel
 
     # Round the screen's own corners so the glass meets the bezel cleanly.
@@ -192,28 +190,9 @@ def build_device_frame(
         width=edge_w,
     )
 
-    # Place the screen.
+    # Place the screen. The screenshot already includes the status bar /
+    # Dynamic Island / hole-punch, so the frame draws no cutout over it.
     body.alpha_composite(screen, (bezel, bezel))
-
-    # --- camera cutouts (drawn on top of the screen) ---
-    cx = dev_w // 2
-    if style in ("iphone-pro", "iphone"):
-        if style == "iphone-pro":
-            iw = int(round(ISLAND_W_FRAC * sw))
-            ih = int(round(ISLAND_H_FRAC * sw))
-        else:  # legacy notch
-            iw = int(round(NOTCH_W_FRAC * sw))
-            ih = int(round(NOTCH_H_FRAC * sw))
-        top = bezel + int(round(ISLAND_TOP_FRAC * sh))
-        bd.rounded_rectangle(
-            (cx - iw // 2, top, cx + iw // 2, top + ih),
-            radius=ih // 2,
-            fill=scheme["island"],
-        )
-    elif style == "android":
-        r = int(round(HOLE_R_FRAC * sw))
-        top = bezel + int(round(ISLAND_TOP_FRAC * sh)) + r
-        bd.ellipse((cx - r, top - r, cx + r, top + r), fill=scheme["island"])
 
     # (Side buttons are drawn later, on the canvas, so they can protrude past
     # the device edge into the margin instead of being clipped by `body`.)

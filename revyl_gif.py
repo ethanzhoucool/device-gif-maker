@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """device-gif-maker -- any flow -> a clean looping GIF on a pristine device frame.
 
-Drives a Revyl cloud device through a flow (defined in YAML/JSON), captures a
-screenshot at every UI state, frames each one in a pristine device mockup, and
-encodes a smooth, seamlessly-looping GIF (+ optional MP4) ready to drop into a
-README or a tweet.
+Drives a device through a flow (defined in YAML/JSON), captures a screenshot at
+every UI state, frames each one in a pristine device mockup, and encodes a
+smooth, seamlessly-looping GIF (+ optional MP4) for a README or a tweet.
 
-    revyl-gif flows/example.yaml
-    revyl-gif flows/example.yaml --attach <session-id>
-    revyl-gif flows/example.yaml --dry-run        # re-render from captured frames
+    revyl-gif flows/example.yaml              # Revyl cloud device (default)
+    revyl-gif local flows/example.yaml        # local iOS simulator (xcrun simctl)
+    revyl-gif local --manual                  # local sim: press Enter to grab each screen
+    revyl-gif flows/example.yaml --dry-run    # re-render from captured frames, no device
 
-Built on the Revyl CLI (`revyl device ...`). See README.md.
+Cloud mode uses the Revyl CLI (`revyl device ...`) with natural-language
+targeting. Local mode uses `xcrun simctl` (+ `idb` for taps) against a booted
+simulator. See README.md.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import argparse
 import html
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -70,7 +73,7 @@ DEFAULTS = {
 
 # Actions that take no value -- only fire when the flow sets them to a truthy
 # value, so `back: false` (e.g. a disabled step in a template) is a no-op
-# instead of silently navigating away.
+# instead of silently firing.
 FLAG_ACTIONS = {
     "back": "back",
     "home": "home",
@@ -87,6 +90,19 @@ def _deep_merge(base, override):
         else:
             out[k] = v
     return out
+
+
+def default_flow(name):
+    """A flow with no steps -- used by `local --manual` / no-flow runs."""
+    return {
+        "platform": "ios",
+        "name": name,
+        "app": {},
+        "steps": [],
+        "frame": dict(DEFAULTS["frame"]),
+        "output": dict(DEFAULTS["output"]),
+        "capture": dict(DEFAULTS["capture"]),
+    }
 
 
 def load_flow(path):
@@ -108,13 +124,13 @@ def load_flow(path):
     return flow
 
 
-# --------------------------------------------------------------------------- #
-# Revyl CLI plumbing
-# --------------------------------------------------------------------------- #
+class DeviceError(RuntimeError):
+    """Any failure talking to a device backend (cloud or local sim)."""
 
-class RevylError(RuntimeError):
-    pass
 
+# --------------------------------------------------------------------------- #
+# Cloud backend: the Revyl CLI (`revyl device ...`)
+# --------------------------------------------------------------------------- #
 
 def revyl(args, *, quiet=False, check=True, capture=True):
     cmd = ["revyl", *args]
@@ -122,7 +138,7 @@ def revyl(args, *, quiet=False, check=True, capture=True):
         print(f"  $ {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=capture, text=True)
     if check and proc.returncode != 0:
-        raise RevylError(
+        raise DeviceError(
             f"`{' '.join(cmd)}` failed ({proc.returncode}):\n{proc.stderr or proc.stdout}"
         )
     return proc
@@ -145,19 +161,31 @@ def start_session(flow, timeout):
         args += ["--launch-var", str(var)]
 
     revyl(args)
-    print("  -> device session ready")
+    print("  -> cloud device ready")
+
+
+def revyl_screenshot(out_path, retries=2):
+    last = None
+    for _ in range(retries + 1):
+        try:
+            revyl(["device", "screenshot", "--out", str(out_path)], quiet=True)
+            with Image.open(out_path) as im:
+                im.verify()
+            return True
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            time.sleep(0.6)
+    print(f"  ! screenshot failed after {retries + 1} tries: {last}")
+    return False
 
 
 def step_to_argv(step):
-    """Translate one flow step into `revyl device ...` arguments.
+    """Translate one flow step into `revyl device ...` arguments (cloud mode).
 
-    A step is a dict with exactly one action key plus optional control keys
-    (capture / hold / label / settle). Targets may be natural language
-    (`target:`) or coordinates (`x:`/`y:`). Returns the argv list, or `None`
-    for a recognized-but-disabled flag action (e.g. `back: false`) so the
-    runner can treat it as a capture-only no-op. Raises RevylError if no known
-    action key is present, so flow-authoring typos fail fast (before any
-    device is provisioned).
+    A step has one action key plus optional control keys (capture / hold /
+    label / settle). Targets may be natural language (`target:`) or coordinates
+    (`x:`/`y:`). Returns the argv list, `None` for a recognized-but-disabled
+    flag action (e.g. `back: false`), or raises DeviceError on an unknown key.
     """
     def tgt(d):
         a = []
@@ -169,9 +197,6 @@ def step_to_argv(step):
             a += ["--y", str(d["y"])]
         return a
 
-    # No-value flag actions: dispatch on truthiness, not mere presence. A flag
-    # left falsy (e.g. `back: false` in a template) is recorded but must not
-    # shadow a real action key present in the same step.
     disabled_flag = False
     for key, cmd in FLAG_ACTIONS.items():
         if key in step:
@@ -221,57 +246,262 @@ def step_to_argv(step):
         return ["device", "instruction", str(step["instruction"])]
     if disabled_flag:
         return None  # only a disabled flag action present -> capture-only no-op
-    raise RevylError(f"Unrecognized step (no known action key): {step}")
+    raise DeviceError(f"Unrecognized step (no known action key): {step}")
 
 
-def screenshot(out_path, retries=2):
+class CloudDriver:
+    """Backend: a Revyl cloud device with natural-language targeting."""
+
+    label = "Revyl cloud device"
+    source = "a Revyl cloud device"
+    supports_attach = True
+
+    def start(self, flow, timeout):
+        start_session(flow, timeout)
+
+    def attach(self, session_id):
+        revyl(["device", "attach", session_id])
+
+    def screenshot(self, path):
+        return revyl_screenshot(path)
+
+    def translate(self, step):
+        return step_to_argv(step)
+
+    def describe(self, action):
+        return action[1] if action else "(disabled)"
+
+    def perform(self, action):
+        if action is not None:
+            revyl(action)
+
+    def teardown(self, keep, attach):
+        if attach:
+            return
+        if keep:
+            print("  -> session kept alive")
+            return
+        revyl(["device", "stop", "--all"], check=False, quiet=True)
+        print("  -> session stopped")
+
+
+# --------------------------------------------------------------------------- #
+# Local backend: a booted iOS simulator (`xcrun simctl`, optional `idb`)
+# --------------------------------------------------------------------------- #
+
+def simctl(args, *, check=True, quiet=True):
+    cmd = ["xcrun", "simctl", *args]
+    if not quiet:
+        print(f"  $ {' '.join(cmd)}")
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise DeviceError("`xcrun` not found. Install Xcode / the command line tools "
+                          "to use local simulator mode.")
+    if check and proc.returncode != 0:
+        raise DeviceError(f"`{' '.join(cmd)}` failed:\n{proc.stderr or proc.stdout}")
+    return proc
+
+
+def _ensure_booted_sim():
+    proc = simctl(["list", "devices", "booted"], check=False)
+    if "Booted" not in (proc.stdout or ""):
+        raise DeviceError("No booted iOS simulator found. Open Simulator.app and boot a "
+                          "device first (or `xcrun simctl boot <udid>`), then retry.")
+
+
+def simctl_screenshot(out_path, retries=2):
+    # simctl resolves relative paths against the CoreSimulator service's working
+    # directory (effectively /), not our cwd -- always hand it an absolute path.
+    target = os.path.abspath(str(out_path))
     last = None
-    for attempt in range(retries + 1):
+    for _ in range(retries + 1):
         try:
-            revyl(["device", "screenshot", "--out", str(out_path)], quiet=True)
-            with Image.open(out_path) as im:
+            simctl(["io", "booted", "screenshot", target])
+            with Image.open(target) as im:
                 im.verify()
             return True
         except Exception as exc:  # noqa: BLE001
             last = exc
-            time.sleep(0.6)
-    print(f"  ! screenshot failed after {retries + 1} tries: {last}")
+            time.sleep(0.4)
+    print(f"  ! simulator screenshot failed after {retries + 1} tries: {last}")
     return False
+
+
+def _idb_available():
+    return shutil.which("idb") is not None
+
+
+def idb(args, *, check=True):
+    proc = subprocess.run(["idb", *args], capture_output=True, text=True)
+    if check and proc.returncode != 0:
+        raise DeviceError(f"`idb {' '.join(args)}` failed:\n{proc.stderr or proc.stdout}")
+    return proc
+
+
+def _sim_coords(d, action):
+    if "x" not in d or "y" not in d:
+        if "target" in d:
+            raise DeviceError(
+                f"local mode can't ground the natural-language target "
+                f"{d['target']!r}. Use x/y coordinates, capture by hand with "
+                f"--manual, or use the cloud (Revyl) backend.")
+        raise DeviceError(f"local `{action}` needs x/y coordinates: {d}")
+    return str(d["x"]), str(d["y"])
+
+
+def sim_translate(step, bundle):
+    """Translate a flow step into a local-simulator action, or raise if the
+    local backend can't perform it. Returns (kind, payload) or None (disabled).
+    """
+    disabled_flag = False
+    for key in FLAG_ACTIONS:
+        if key in step:
+            if not step[key]:
+                disabled_flag = True
+                continue
+            if key == "kill_app":
+                if not bundle:
+                    raise DeviceError("local `kill_app` needs app.bundle_id in the flow")
+                return ("term", bundle)
+            raise DeviceError(f"`{key}` isn't supported on a local iOS simulator")
+
+    if "navigate" in step:
+        return ("url", str(step["navigate"]))
+    if "launch" in step:
+        return ("launch", str(step["launch"]))
+    if "wait" in step:
+        return ("wait", float(step["wait"]) / 1000.0)
+    if "tap" in step:
+        x, y = _sim_coords(step["tap"], "tap")
+        return ("idb", ["ui", "tap", x, y])
+    if "double_tap" in step:
+        x, y = _sim_coords(step["double_tap"], "double_tap")
+        return ("idb2", ["ui", "tap", x, y])
+    if "long_press" in step:
+        d = step["long_press"]
+        x, y = _sim_coords(d, "long_press")
+        return ("idb", ["ui", "tap", "--duration", str(d.get("duration", 1.0)), x, y])
+    if "drag" in step:
+        d = step["drag"]
+        return ("idb", ["ui", "swipe",
+                        str(d["start_x"]), str(d["start_y"]),
+                        str(d["end_x"]), str(d["end_y"])])
+    if "swipe" in step:
+        raise DeviceError("local mode: use `drag` with explicit start/end coords "
+                          "instead of `swipe` (no NL grounding locally)")
+    if "type" in step:
+        return ("idb", ["ui", "text", str(step["type"].get("text", ""))])
+    if "instruction" in step:
+        raise DeviceError("natural-language `instruction` needs the cloud (Revyl) "
+                          "backend; not available on a local simulator")
+    if disabled_flag:
+        return None
+    raise DeviceError(f"Unrecognized/unsupported local step: {step}")
+
+
+class SimDriver:
+    """Backend: a booted local iOS simulator via `xcrun simctl` (+ `idb`)."""
+
+    label = "local simulator"
+    source = "a local iOS simulator"
+    supports_attach = False
+
+    def __init__(self):
+        self.bundle = None
+
+    def start(self, flow, timeout):
+        _ensure_booted_sim()
+        app = flow.get("app", {})
+        self.bundle = app.get("bundle_id")
+        path = app.get("app_path") or app.get("app_url")
+        if path and os.path.exists(str(path)):
+            simctl(["install", "booted", str(path)])
+            print(f"  -> installed {path}")
+        if self.bundle:
+            simctl(["launch", "booted", self.bundle])
+            print(f"  -> launched {self.bundle}")
+        else:
+            print("  -> using the app already on the booted simulator")
+
+    def attach(self, session_id):
+        raise DeviceError("--attach isn't supported on a local simulator")
+
+    def screenshot(self, path):
+        return simctl_screenshot(path)
+
+    def translate(self, step):
+        return sim_translate(step, self.bundle)
+
+    def describe(self, action):
+        return action[0] if action else "(disabled)"
+
+    def perform(self, action):
+        if action is None:
+            return
+        kind, payload = action
+        if kind == "url":
+            simctl(["openurl", "booted", payload])
+        elif kind == "launch":
+            simctl(["launch", "booted", payload])
+        elif kind == "term":
+            simctl(["terminate", "booted", payload])
+        elif kind == "wait":
+            time.sleep(payload)
+        elif kind in ("idb", "idb2"):
+            if not _idb_available():
+                raise DeviceError("this step needs `idb` to control the simulator UI. "
+                                  "Install it (https://fbidb.io), or capture by hand "
+                                  "with --manual.")
+            idb(payload)
+            if kind == "idb2":  # double tap
+                idb(payload)
+        else:  # pragma: no cover
+            raise DeviceError(f"unknown sim action: {kind}")
+
+    def teardown(self, keep, attach):
+        print("  -> left the simulator running")
 
 
 # --------------------------------------------------------------------------- #
 # Capture
 # --------------------------------------------------------------------------- #
 
-def capture_flow(flow, frames_dir, attach=None, timeout=600, keep=False):
+def _write_manifest(frames_dir, frames):
+    manifest = [{"file": p.name, "hold": h, "label": lbl} for p, h, lbl in frames]
+    (frames_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+
+
+def capture_flow(flow, frames_dir, driver, attach=None, timeout=600, keep=False):
     cap = flow["capture"]
     frames_dir.mkdir(parents=True, exist_ok=True)
-
     out_hold = flow["output"]["hold"]
-    # Translate + validate every step up front so a bad action key or a
-    # non-numeric hold/settle fails fast, before we provision a (billable,
-    # concurrency-limited) device.
+
+    # Translate + validate every step up front so a bad/unsupported action or a
+    # non-numeric hold/settle fails fast, before we provision a device.
     plan = []
     for step in flow["steps"]:
-        argv = step_to_argv(step)
+        action = driver.translate(step)
         try:
             float(step.get("hold", out_hold))
             float(step.get("settle", cap["settle"]))
         except (TypeError, ValueError):
-            raise RevylError(f"step has a non-numeric hold/settle: {step}")
-        plan.append((step, argv))
+            raise DeviceError(f"step has a non-numeric hold/settle: {step}")
+        plan.append((step, action))
 
-    print(f"\n== Capturing flow '{flow['name']}' on a cloud device ==")
+    print(f"\n== Capturing flow '{flow['name']}' on the {driver.label} ==")
     if attach:
-        revyl(["device", "attach", attach])
+        if not driver.supports_attach:
+            raise DeviceError(f"--attach isn't supported on the {driver.label}")
+        driver.attach(attach)
     else:
-        start_session(flow, timeout)
+        driver.start(flow, timeout)
 
     frames = []  # list of (path, hold, label)
 
     def grab(idx, hold, label):
         path = frames_dir / f"state_{idx:03d}.png"
-        if screenshot(path):
+        if driver.screenshot(path):
             frames.append((path, hold, label))
             print(f"  [{idx:02d}] captured {label or ''}")
 
@@ -279,39 +509,67 @@ def capture_flow(flow, frames_dir, attach=None, timeout=600, keep=False):
         idx = 0
         if cap["initial"]:
             time.sleep(cap["launch_settle"])
-            grab(idx, flow["output"]["hold"], "initial")
+            grab(idx, out_hold, "initial")
             idx += 1
 
-        for step, argv in plan:
+        for step, action in plan:
             label = step.get("label", "")
-            if argv is None:
+            if action is None:
                 print(f"  step: (disabled) {label}")
             else:
-                print(f"  step: {argv[1]} {label}")
+                print(f"  step: {driver.describe(action)} {label}")
                 try:
-                    revyl(argv)
-                except RevylError as exc:
-                    # Salvage the run: stop here and render what we captured
-                    # rather than discarding the session's work.
+                    driver.perform(action)
+                except DeviceError as exc:
+                    # Salvage the run: stop here and render what we captured.
                     print(f"  ! step failed, ending flow early: {exc}")
                     break
             settle = float(step.get("settle", cap["settle"]))
             if settle:
                 time.sleep(settle)
             if step.get("capture", True):
-                grab(idx, float(step.get("hold", flow["output"]["hold"])),
-                     step.get("label"))
+                grab(idx, float(step.get("hold", out_hold)), step.get("label"))
                 idx += 1
     finally:
-        # Always release the cloud session we started, even on error -- a
-        # leaked session blocks every later run under a concurrency cap.
-        if not keep and not attach:
-            revyl(["device", "stop", "--all"], check=False, quiet=True)
-            print("  -> session stopped")
+        driver.teardown(keep, attach)
         # Always record a manifest (even on error) so whatever frames were
         # captured can still be re-rendered with `--dry-run`.
-        manifest = [{"file": p.name, "hold": h, "label": lbl} for p, h, lbl in frames]
-        (frames_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        _write_manifest(frames_dir, frames)
+
+    return frames
+
+
+def capture_manual(flow, frames_dir, driver, keep=False, attach=None):
+    """Interactive capture: you drive the device, press Enter to grab each
+    screen. The natural fit for a local simulator (no UI automation needed)."""
+    if not sys.stdin.isatty():
+        sys.exit("--manual needs an interactive terminal.")
+    frames_dir.mkdir(parents=True, exist_ok=True)
+    out_hold = flow["output"]["hold"]
+
+    print(f"\n== Manual capture on the {driver.label} ==")
+    if attach and driver.supports_attach:
+        driver.attach(attach)
+    else:
+        driver.start(flow, timeout=flow.get("timeout", 600))
+
+    print("Drive the app yourself. Press Enter to capture each screen; "
+          "type q then Enter to finish.")
+    frames = []
+    try:
+        idx = 0
+        while True:
+            resp = input(f"  [{idx:02d}] Enter = capture, q = finish: ").strip().lower()
+            if resp in ("q", "quit", "done"):
+                break
+            path = frames_dir / f"state_{idx:03d}.png"
+            if driver.screenshot(path):
+                frames.append((path, out_hold, f"state {idx}"))
+                print(f"       captured {path.name}")
+                idx += 1
+    finally:
+        driver.teardown(keep, attach)
+        _write_manifest(frames_dir, frames)
 
     return frames
 
@@ -520,7 +778,7 @@ def _preview_card(path):
             f'<div class="label">{text}</div><div class="meta">{meta}</div></div>')
 
 
-def write_preview(out_dir, flow, outputs, loop_seconds):
+def write_preview(out_dir, flow, outputs, loop_seconds, source="a device"):
     """Compile a self-contained HTML viewer next to the GIF/MP4 outputs."""
     f = flow["frame"]
     cards = "\n      ".join(_preview_card(p) for p in outputs
@@ -528,6 +786,7 @@ def write_preview(out_dir, flow, outputs, loop_seconds):
     name = html.escape(str(flow["name"]))
     sub = html.escape(f"{f['style']} · {f['color']} · {f['background']} bg · "
                       f"{loop_seconds:.1f}s loop")
+    footer = html.escape(f"Generated by device-gif-maker on {source}")
     doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <title>{name} — device-gif-maker</title>
@@ -538,7 +797,7 @@ def write_preview(out_dir, flow, outputs, loop_seconds):
   <div class="row">
       {cards}
   </div>
-  <footer>Generated by device-gif-maker on a real Revyl cloud device</footer>
+  <footer>{footer}</footer>
 </body></html>
 """
     path = out_dir / "preview.html"
@@ -551,14 +810,27 @@ def write_preview(out_dir, flow, outputs, loop_seconds):
 # --------------------------------------------------------------------------- #
 
 def main():
+    # Optional leading subcommand: `revyl-gif local ...` selects the local
+    # simulator backend; otherwise the Revyl cloud backend is used.
+    raw = sys.argv[1:]
+    mode = "cloud"
+    if raw and raw[0] == "local":
+        mode, raw = "local", raw[1:]
+
     p = argparse.ArgumentParser(
-        description="Any flow -> a clean looping GIF on a pristine device frame.")
-    p.add_argument("flow", help="Path to a flow spec (.yaml / .yml / .json)")
+        prog="revyl-gif",
+        description="Any flow -> a clean looping GIF on a pristine device frame. "
+                    "Prefix with `local` to drive a booted iOS simulator instead "
+                    "of a Revyl cloud device.")
+    p.add_argument("flow", nargs="?", default=None,
+                   help="Flow spec (.yaml/.yml/.json). Optional in `local` mode.")
     p.add_argument("--out", default=None, help="Output directory (default: ./out/<name>)")
-    p.add_argument("--attach", help="Attach to an existing device session id")
-    p.add_argument("--timeout", type=int, default=600, help="Session idle timeout (s)")
+    p.add_argument("--attach", help="Attach to an existing cloud session id")
+    p.add_argument("--timeout", type=int, default=600, help="Cloud session idle timeout (s)")
     p.add_argument("--keep-session", action="store_true",
-                   help="Don't stop the device session when done")
+                   help="Don't stop the cloud session when done")
+    p.add_argument("--manual", action="store_true",
+                   help="Drive the device yourself; press Enter to capture each screen")
     p.add_argument("--dry-run", action="store_true",
                    help="Skip the device; re-render from already-captured frames")
     # quick overrides (otherwise taken from the flow spec / defaults)
@@ -578,9 +850,14 @@ def main():
                    help="Open the preview HTML when done (default: only in a TTY)")
     p.add_argument("--no-open", action="store_true",
                    help="Never open the preview HTML")
-    args = p.parse_args()
+    args = p.parse_args(raw)
 
-    flow = load_flow(args.flow)
+    if args.flow:
+        flow = load_flow(args.flow)
+    elif mode == "local" or args.dry_run:
+        flow = default_flow(Path(args.out).name if args.out else "sim-capture")
+    else:
+        p.error("a flow file is required for cloud mode (or use `local` / --manual)")
 
     # apply CLI overrides (use `is not None` so 0 / 0.0 are honoured, not dropped)
     f, o = flow["frame"], flow["output"]
@@ -625,16 +902,24 @@ def main():
     seq_dir = out_dir / "seq"
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    driver = SimDriver() if mode == "local" else CloudDriver()
+
     # 1. capture (or reuse) raw screenshots
-    if args.dry_run:
-        print(f"== Dry run: re-rendering from {frames_dir} ==")
-        # An explicit --hold means "uniform hold"; otherwise honour the manifest.
-        frames = load_captured(frames_dir, o["hold"], use_manifest=(args.hold is None))
-    else:
-        frames = capture_flow(flow, frames_dir, attach=args.attach,
-                              timeout=args.timeout, keep=args.keep_session)
-        if not frames:
-            sys.exit("No frames captured -- aborting.")
+    try:
+        if args.dry_run:
+            print(f"== Dry run: re-rendering from {frames_dir} ==")
+            # An explicit --hold means "uniform hold"; else honour the manifest.
+            frames = load_captured(frames_dir, o["hold"], use_manifest=(args.hold is None))
+        elif args.manual or (mode == "local" and not flow["steps"]):
+            frames = capture_manual(flow, frames_dir, driver,
+                                    keep=args.keep_session, attach=args.attach)
+        else:
+            frames = capture_flow(flow, frames_dir, driver, attach=args.attach,
+                                  timeout=args.timeout, keep=args.keep_session)
+    except DeviceError as exc:
+        sys.exit(f"error: {exc}")
+    if not frames:
+        sys.exit("No frames captured -- aborting.")
 
     print(f"\n== Framing {len(frames)} states ==")
     states = composite_states(frames, f, flow["capture"]["dedup"])
@@ -660,7 +945,8 @@ def main():
         outputs.append(mp4_path)
 
     # compile a self-contained HTML viewer next to the outputs
-    preview = write_preview(out_dir, flow, outputs, total / o["fps"]) if outputs else None
+    preview = (write_preview(out_dir, flow, outputs, total / o["fps"], source=driver.source)
+               if outputs else None)
 
     print("\nDone:")
     for path in outputs:
