@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Thin launcher so you can run `./revyl-gif ...` (or symlink it onto your PATH).
+exec python3 "$(dirname "$0")/revyl_gif.py" "$@"

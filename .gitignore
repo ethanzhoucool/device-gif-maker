@@ -1,0 +1,13 @@
+# Generated runs (screenshots, frame sequences, encoded GIF/MP4).
+# Committed demo assets live in demo/ instead.
+out/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# macOS
+.DS_Store

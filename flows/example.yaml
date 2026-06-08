@@ -1,0 +1,52 @@
+# Example flow: search for an artist and play a song.
+# Run with:  revyl-gif flows/example.yaml
+#
+# Targets use natural language -- the Revyl agent grounds them on the live UI,
+# so you don't hardcode coordinates. Every step captures a frame by default;
+# set `capture: false` on setup/scaffolding steps you don't want in the GIF.
+
+name: search-and-play
+platform: ios
+
+# Pick ONE source for the app under test:
+app:
+  app_id: "REPLACE_WITH_APP_ID"      # resolves the latest build
+  # app_url: "https://.../MyApp.zip" # or a direct .app/.ipa/.apk/.zip
+  # build_version_id: "..."          # or a specific build
+
+# Optional device pin (omit to use the org default device):
+# device_model: "iPhone 16 Pro"
+# os_version: "iOS 26.2"
+
+frame:
+  style: iphone-pro        # iphone-pro | iphone | android
+  color: black             # black | graphite | silver | white
+  background: light        # light | dark | midnight | white | transparent | "#rrggbb"
+  shadow: true
+  width: 440               # rendered screen width in px (frame scales around it)
+
+output:
+  gif: true
+  mp4: true
+  fps: 30
+  hold: 1.3                # default seconds each state is held
+  xfade: 0.45              # crossfade seconds between states
+  loop: true               # seamless crossfade from the last state back to the first
+  pingpong: false
+
+steps:
+  - tap: { target: "Search tab" }
+    label: "open search"
+    hold: 1.0
+  - tap: { target: "search field" }
+    capture: false         # just focusing the field, skip this frame
+  - type: { target: "search field", text: "Daft Punk" }
+    label: "type query"
+  - key: ENTER
+    label: "results"
+    hold: 1.4
+  - tap: { target: "first song in the results list" }
+    label: "open track"
+  - tap: { target: "play button" }
+    label: "now playing"
+    hold: 2.0

@@ -1,0 +1,4 @@
+Pillow>=10.0
+PyYAML>=6.0
+# ffmpeg must be on PATH (brew install ffmpeg) -- used for GIF/MP4 encoding.
+# The Revyl CLI must be installed and authenticated (`revyl auth login`).
