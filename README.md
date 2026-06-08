@@ -3,8 +3,8 @@
 **Any flow → a clean looping GIF on a pristine device frame.**
 
 Drop a few steps in a YAML file, point it at your app, and get back a polished,
-seamlessly-looping GIF (and an MP4) of the flow running on a ** cloud
-device** — framed in a clean phone mockup, ready for a README or a tweet.
+seamlessly-looping GIF (and an MP4) of the flow running on a **cloud
+device**  framed in a clean phone mockup, ready for a README or a tweet.
 
 No screen recorder, no Figma, no After Effects, no mockup PNGs. Just the
 [Revyl CLI](https://docs.revyl.ai) + `ffmpeg`.
