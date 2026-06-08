@@ -82,10 +82,12 @@ BACKGROUND_PRESETS = {
 }
 
 
-def _hex_to_rgb(value: str):
+def hex_to_rgb(value: str):
     value = value.lstrip("#")
     if len(value) == 3:
         value = "".join(c * 2 for c in value)
+    if len(value) != 6:
+        raise ValueError(f"bad hex color: {value!r}")
     return tuple(int(value[i : i + 2], 16) for i in (0, 2, 4))
 
 
@@ -100,13 +102,14 @@ def _rounded_mask(size, radius):
 
 def _vertical_gradient(size, top_rgb, bottom_rgb):
     w, h = size
+    denom = max(1, h - 1)
+    column = [
+        tuple(round(top_rgb[i] + (bottom_rgb[i] - top_rgb[i]) * (y / denom))
+              for i in range(3))
+        for y in range(h)
+    ]
     grad = Image.new("RGB", (1, h))
-    for y in range(h):
-        t = y / max(1, h - 1)
-        grad.putpixel(
-            (0, y),
-            tuple(round(top_rgb[i] + (bottom_rgb[i] - top_rgb[i]) * t) for i in range(3)),
-        )
+    grad.putdata(column)  # one C-level call instead of h putpixel() round-trips
     return grad.resize((w, h)).convert("RGBA")
 
 
@@ -118,17 +121,23 @@ def _make_background(size, background):
       - a named preset ("light"/"dark"/"midnight"/...)
       - a "#rrggbb" solid color
       - a dict {"gradient": ["#top", "#bottom"]}
+
+    Malformed colors fall back to the "light" preset rather than crashing a
+    render that may already have cost a device session.
     """
-    w, h = size
-    if isinstance(background, dict) and "gradient" in background:
-        top, bottom = background["gradient"][0], background["gradient"][1]
-        return _vertical_gradient(size, _hex_to_rgb(top), _hex_to_rgb(bottom))
+    try:
+        if isinstance(background, dict) and "gradient" in background:
+            stops = background["gradient"]
+            return _vertical_gradient(size, hex_to_rgb(stops[0]), hex_to_rgb(stops[-1]))
+        if isinstance(background, str) and background.startswith("#"):
+            return Image.new("RGBA", size, hex_to_rgb(background) + (255,))
+    except (ValueError, IndexError, TypeError):
+        pass  # fall through to a preset
 
-    if isinstance(background, str) and background.startswith("#"):
-        rgb = _hex_to_rgb(background)
-        return Image.new("RGBA", size, rgb + (255,))
-
-    preset = BACKGROUND_PRESETS.get(background, BACKGROUND_PRESETS["light"])
+    key = background if isinstance(background, str) else "light"
+    if key not in BACKGROUND_PRESETS:
+        key = "light"
+    preset = BACKGROUND_PRESETS[key]
     if preset is None:  # transparent
         return Image.new("RGBA", size, (0, 0, 0, 0))
     return _vertical_gradient(size, preset[0], preset[1])
@@ -206,26 +215,8 @@ def build_device_frame(
         top = bezel + int(round(ISLAND_TOP_FRAC * sh)) + r
         bd.ellipse((cx - r, top - r, cx + r, top + r), fill=scheme["island"])
 
-    # --- side buttons ---
-    if buttons:
-        btn_w = max(2, int(round(bezel * 0.5)))
-        # power (right)
-        p_top = int(round(BTN_POWER_TOP_FRAC * dev_h))
-        p_len = int(round(BTN_POWER_LEN_FRAC * dev_h))
-        bd.rounded_rectangle(
-            (dev_w - 1, p_top, dev_w - 1 + btn_w, p_top + p_len),
-            radius=btn_w,
-            fill=scheme["button"],
-        )
-        # volume up/down + ringer (left)
-        v_top = int(round(BTN_VOL_TOP_FRAC * dev_h))
-        v_len = int(round(BTN_VOL_LEN_FRAC * dev_h))
-        gap = int(round(BTN_VOL_GAP_FRAC * dev_h))
-        for i in range(2):
-            y0 = v_top + i * (v_len + gap)
-            bd.rounded_rectangle(
-                (-btn_w, y0, 0, y0 + v_len), radius=btn_w, fill=scheme["button"]
-            )
+    # (Side buttons are drawn later, on the canvas, so they can protrude past
+    # the device edge into the margin instead of being clipped by `body`.)
 
     # --- canvas with background + shadow ---
     margin = int(round(MARGIN_FRAC * dev_w))
@@ -247,6 +238,29 @@ def build_device_frame(
         canvas.alpha_composite(sh_layer)
 
     canvas.alpha_composite(body, (margin, margin))
+
+    # --- side buttons (on the canvas, protruding into the margin) ---
+    if buttons:
+        cd = ImageDraw.Draw(canvas)
+        btn_w = max(2, int(round(bezel * 0.5)))
+        # power (right edge)
+        p_top = margin + int(round(BTN_POWER_TOP_FRAC * dev_h))
+        p_len = int(round(BTN_POWER_LEN_FRAC * dev_h))
+        right = margin + dev_w
+        cd.rounded_rectangle(
+            (right - 1, p_top, right + btn_w, p_top + p_len),
+            radius=btn_w // 2, fill=scheme["button"],
+        )
+        # volume up/down + ringer (left edge)
+        v_top = margin + int(round(BTN_VOL_TOP_FRAC * dev_h))
+        v_len = int(round(BTN_VOL_LEN_FRAC * dev_h))
+        gap = int(round(BTN_VOL_GAP_FRAC * dev_h))
+        for i in range(2):
+            y0 = v_top + i * (v_len + gap)
+            cd.rounded_rectangle(
+                (margin - btn_w, y0, margin + 1, y0 + v_len),
+                radius=btn_w // 2, fill=scheme["button"],
+            )
 
     # Downscale from supersampled space.
     final = canvas.resize((canvas_w // SS, canvas_h // SS), Image.LANCZOS)

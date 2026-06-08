@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""revyl-gifmaker -- any flow -> a clean looping GIF on a pristine device frame.
+"""device-gif-maker -- any flow -> a clean looping GIF on a pristine device frame.
 
 Drives a Revyl cloud device through a flow (defined in YAML/JSON), captures a
 screenshot at every UI state, frames each one in a pristine device mockup, and
@@ -64,6 +64,16 @@ DEFAULTS = {
         "launch_settle": 2.5,  # seconds after session start before first screenshot
         "dedup": True,      # merge consecutive identical frames into one longer hold
     },
+}
+
+# Actions that take no value -- only fire when the flow sets them to a truthy
+# value, so `back: false` (e.g. a disabled step in a template) is a no-op
+# instead of silently navigating away.
+FLAG_ACTIONS = {
+    "back": "back",
+    "home": "home",
+    "shake": "shake",
+    "kill_app": "kill-app",
 }
 
 
@@ -132,35 +142,8 @@ def start_session(flow, timeout):
     for var in flow.get("launch_vars", []):
         args += ["--launch-var", str(var)]
 
-    proc = revyl(args)
-    session_id = _find_session_id(proc.stdout)
-    print(f"  -> session {session_id or '(active)'} ready")
-    return session_id
-
-
-def _find_session_id(stdout):
-    """Best-effort: pull a session id out of `device start --json` output."""
-    try:
-        data = json.loads(stdout)
-    except (json.JSONDecodeError, TypeError):
-        return None
-
-    def walk(obj):
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                if isinstance(v, str) and "session" in k.lower() and "id" in k.lower():
-                    return v
-                found = walk(v)
-                if found:
-                    return found
-        elif isinstance(obj, list):
-            for item in obj:
-                found = walk(item)
-                if found:
-                    return found
-        return None
-
-    return walk(data)
+    revyl(args)
+    print("  -> device session ready")
 
 
 def step_to_argv(step):
@@ -168,7 +151,11 @@ def step_to_argv(step):
 
     A step is a dict with exactly one action key plus optional control keys
     (capture / hold / label / settle). Targets may be natural language
-    (`target:`) or coordinates (`x:`/`y:`).
+    (`target:`) or coordinates (`x:`/`y:`). Returns the argv list, or `None`
+    for a recognized-but-disabled flag action (e.g. `back: false`) so the
+    runner can treat it as a capture-only no-op. Raises RevylError if no known
+    action key is present, so flow-authoring typos fail fast (before any
+    device is provisioned).
     """
     def tgt(d):
         a = []
@@ -179,6 +166,11 @@ def step_to_argv(step):
         if "y" in d:
             a += ["--y", str(d["y"])]
         return a
+
+    # No-value flag actions: dispatch on truthiness, not mere presence.
+    for key, cmd in FLAG_ACTIONS.items():
+        if key in step:
+            return ["device", cmd] if step[key] else None
 
     if "tap" in step:
         return ["device", "tap", *tgt(step["tap"])]
@@ -212,19 +204,12 @@ def step_to_argv(step):
         return ["device", "launch", str(step["launch"])]
     if "open_app" in step:
         return ["device", "open-app", str(step["open_app"])]
-    if "kill_app" in step:
-        return ["device", "kill-app"]
     if "key" in step:
         return ["device", "key", str(step["key"])]
-    if "back" in step:
-        return ["device", "back"]
-    if "home" in step:
-        return ["device", "home"]
-    if "shake" in step:
-        return ["device", "shake"]
     if "wait" in step:
-        secs = float(step["wait"]) / (1000.0 if float(step["wait"]) > 50 else 1.0)
-        return ["device", "wait", str(secs)]
+        # `wait` is always milliseconds (matches the README); `revyl device
+        # wait` takes seconds.
+        return ["device", "wait", str(float(step["wait"]) / 1000.0)]
     if "instruction" in step:
         return ["device", "instruction", str(step["instruction"])]
     raise RevylError(f"Unrecognized step (no known action key): {step}")
@@ -253,6 +238,10 @@ def capture_flow(flow, frames_dir, attach=None, timeout=600, keep=False):
     cap = flow["capture"]
     frames_dir.mkdir(parents=True, exist_ok=True)
 
+    # Translate every step up front so an unknown action key fails fast,
+    # before we provision a (billable, concurrency-limited) device.
+    plan = [(step, step_to_argv(step)) for step in flow["steps"]]
+
     print(f"\n== Capturing flow '{flow['name']}' on a cloud device ==")
     if attach:
         revyl(["device", "attach", attach])
@@ -267,36 +256,67 @@ def capture_flow(flow, frames_dir, attach=None, timeout=600, keep=False):
             frames.append((path, hold, label))
             print(f"  [{idx:02d}] captured {label or ''}")
 
-    idx = 0
-    if cap["initial"]:
-        time.sleep(cap["launch_settle"])
-        grab(idx, flow["output"]["hold"], "initial")
-        idx += 1
-
-    for step in flow["steps"]:
-        argv = step_to_argv(step)
-        print(f"  step: {argv[1]} {step.get('label', '')}")
-        revyl(argv)
-        settle = float(step.get("settle", cap["settle"]))
-        if settle:
-            time.sleep(settle)
-        if step.get("capture", True):
-            grab(idx, float(step.get("hold", flow["output"]["hold"])),
-                 step.get("label"))
+    try:
+        idx = 0
+        if cap["initial"]:
+            time.sleep(cap["launch_settle"])
+            grab(idx, flow["output"]["hold"], "initial")
             idx += 1
 
-    if not keep and not attach:
-        try:
-            revyl(["device", "stop", "--all"], check=False)
+        for step, argv in plan:
+            label = step.get("label", "")
+            if argv is None:
+                print(f"  step: (disabled) {label}")
+            else:
+                print(f"  step: {argv[1]} {label}")
+                try:
+                    revyl(argv)
+                except RevylError as exc:
+                    # Salvage the run: stop here and render what we captured
+                    # rather than discarding the session's work.
+                    print(f"  ! step failed, ending flow early: {exc}")
+                    break
+            settle = float(step.get("settle", cap["settle"]))
+            if settle:
+                time.sleep(settle)
+            if step.get("capture", True):
+                grab(idx, float(step.get("hold", flow["output"]["hold"])),
+                     step.get("label"))
+                idx += 1
+    finally:
+        # Always release the cloud session we started, even on error -- a
+        # leaked session blocks every later run under a concurrency cap.
+        if not keep and not attach:
+            revyl(["device", "stop", "--all"], check=False, quiet=True)
             print("  -> session stopped")
-        except RevylError:
-            pass
+
+    # Record per-frame hold/label so `--dry-run` can reproduce the exact
+    # timeline without re-driving the device.
+    manifest = [{"file": p.name, "hold": h, "label": lbl} for p, h, lbl in frames]
+    (frames_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     return frames
 
 
-def load_captured(frames_dir, default_hold):
-    paths = sorted(Path(frames_dir).glob("state_*.png"))
+def load_captured(frames_dir, default_hold, use_manifest=True):
+    """Reload frames for a `--dry-run`. Prefers the capture manifest (so
+    per-state holds/labels survive) and falls back to a uniform hold."""
+    frames_dir = Path(frames_dir)
+    manifest = frames_dir / "manifest.json"
+    if use_manifest and manifest.exists():
+        try:
+            entries = json.loads(manifest.read_text())
+        except (json.JSONDecodeError, OSError):
+            entries = []
+        out = []
+        for e in entries:
+            p = frames_dir / e["file"]
+            if p.exists():
+                out.append((p, float(e.get("hold", default_hold)), e.get("label")))
+        if out:
+            return out
+
+    paths = sorted(frames_dir.glob("state_*.png"))
     if not paths:
         sys.exit(f"No captured frames in {frames_dir} (expected state_*.png).")
     return [(p, default_hold, p.stem) for p in paths]
@@ -324,6 +344,15 @@ def composite_states(frames, frame_opts, dedup):
     prev_hash = None
     for path, hold, label in frames:
         with Image.open(path) as raw:
+            # Hash the raw screenshot, NOT the framed composite -- the bezel and
+            # background are identical across every frame and would otherwise
+            # dominate the hash and merge genuinely distinct UI states.
+            h = _phash(raw)
+            if dedup and prev_hash is not None and _hamming(h, prev_hash) <= 1:
+                # Same UI state: extend the previous hold instead of adding a frame.
+                img, prev_hold, prev_label = states[-1]
+                states[-1] = (img, prev_hold + hold, prev_label)
+                continue
             framed = device_frame.build_device_frame(
                 raw,
                 style=frame_opts["style"],
@@ -333,12 +362,6 @@ def composite_states(frames, frame_opts, dedup):
                 screen_width=frame_opts["width"],
                 buttons=frame_opts["buttons"],
             )
-        h = _phash(framed)
-        if dedup and prev_hash is not None and _hamming(h, prev_hash) <= 1:
-            # Identical UI state: extend the previous hold instead of adding a frame.
-            img, prev_hold, prev_label = states[-1]
-            states[-1] = (img, prev_hold + hold, prev_label)
-            continue
         states.append((framed, hold, label))
         prev_hash = h
     return states
@@ -351,7 +374,22 @@ def build_sequence(states, out_dir, fps, xfade, loop, pingpong, matte):
     # %05d reader can't pick up leftovers when the new render is shorter.
     for old in out_dir.glob("*.png"):
         old.unlink()
-    flat = [(device_frame.flatten(img, _matte(matte)), hold) for img, hold, _ in states]
+
+    matte_rgb = _matte(matte)
+    flat = [(device_frame.flatten(img, matte_rgb), hold) for img, hold, _ in states]
+
+    # Normalize every state to a common canvas so crossfade blends never hit a
+    # size mismatch (e.g. if a step rotated the device to landscape).
+    tw = max(im.width for im, _ in flat)
+    th = max(im.height for im, _ in flat)
+    norm = []
+    for im, hold in flat:
+        if im.size != (tw, th):
+            canvas = Image.new("RGB", (tw, th), matte_rgb)
+            canvas.paste(im, ((tw - im.width) // 2, (th - im.height) // 2))
+            im = canvas
+        norm.append((im, hold))
+    flat = norm
 
     order = list(range(len(flat)))
     if pingpong and len(flat) > 2:
@@ -382,7 +420,10 @@ def build_sequence(states, out_dir, fps, xfade, loop, pingpong, matte):
 
 def _matte(value):
     if isinstance(value, str) and value.startswith("#"):
-        return device_frame._hex_to_rgb(value)
+        try:
+            return device_frame.hex_to_rgb(value)
+        except ValueError:
+            pass
     return (255, 255, 255)
 
 
@@ -394,6 +435,7 @@ def encode_gif(seq_dir, fps, out_path, loop):
     pattern = str(seq_dir / "%05d.png")
     vf = ("[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];"
           "[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle")
+    # ffmpeg gif: -loop 0 = loop forever, -loop -1 = play once.
     cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", pattern,
            "-filter_complex", vf, "-loop", "0" if loop else "-1", str(out_path)]
     subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -448,7 +490,7 @@ def main():
 
     flow = load_flow(args.flow)
 
-    # apply CLI overrides
+    # apply CLI overrides (use `is not None` so 0 / 0.0 are honoured, not dropped)
     f, o = flow["frame"], flow["output"]
     if args.style:
         f["style"] = args.style
@@ -456,13 +498,13 @@ def main():
         f["color"] = args.color
     if args.background:
         f["background"] = args.background
-    if args.width:
+    if args.width is not None:
         f["width"] = args.width
     if args.no_shadow:
         f["shadow"] = False
-    if args.fps:
+    if args.fps is not None:
         o["fps"] = args.fps
-    if args.hold:
+    if args.hold is not None:
         o["hold"] = args.hold
     if args.xfade is not None:
         o["xfade"] = args.xfade
@@ -475,6 +517,17 @@ def main():
     if args.no_mp4:
         o["mp4"] = False
 
+    # validate the values that would otherwise blow up mid-render
+    if o["fps"] <= 0:
+        sys.exit(f"output.fps must be > 0 (got {o['fps']}).")
+    if f["width"] <= 0:
+        sys.exit(f"frame.width must be > 0 (got {f['width']}).")
+    bg = f["background"]
+    if (isinstance(bg, str) and not bg.startswith("#")
+            and bg not in device_frame.BACKGROUND_PRESETS):
+        print(f"  ! unknown background '{bg}'; falling back to 'light'. "
+              f"Options: {', '.join(device_frame.BACKGROUND_PRESETS)} or a #hex color.")
+
     out_dir = Path(args.out or Path("out") / flow["name"])
     frames_dir = out_dir / "frames"
     seq_dir = out_dir / "seq"
@@ -483,7 +536,8 @@ def main():
     # 1. capture (or reuse) raw screenshots
     if args.dry_run:
         print(f"== Dry run: re-rendering from {frames_dir} ==")
-        frames = load_captured(frames_dir, o["hold"])
+        # An explicit --hold means "uniform hold"; otherwise honour the manifest.
+        frames = load_captured(frames_dir, o["hold"], use_manifest=(args.hold is None))
     else:
         frames = capture_flow(flow, frames_dir, attach=args.attach,
                               timeout=args.timeout, keep=args.keep_session)

@@ -85,6 +85,10 @@ touching a device**:
 revyl-gif flows/example.yaml --dry-run --color silver --background midnight --hold 1.6
 ```
 
+Per-state holds and labels are restored from the capture's
+`frames/manifest.json`, so a re-render's timing matches the live run. Pass an
+explicit `--hold` to flatten every state to a single duration instead.
+
 ## Flow spec
 
 A flow is a YAML (or JSON) file. The only required parts are `app` and `steps`.
