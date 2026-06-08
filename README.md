@@ -68,11 +68,16 @@ Outputs land in `out/<flow-name>/`:
 
 ```
 out/search-and-play/
-  frames/        # raw device screenshots, one per state
+  frames/        # raw device screenshots, one per state (+ manifest.json)
   seq/           # the rendered timeline (held + crossfaded frames)
   search-and-play.gif
   search-and-play.mp4
+  preview.html   # a self-contained viewer — opens automatically in a TTY
 ```
+
+Every run compiles a **`preview.html`** next to the outputs (the GIF looping +
+the MP4 autoplaying, side by side) and opens it in your browser. Pass
+`--no-open` to skip the auto-open, or `--open` to force it (e.g. from a script).
 
 ### Iterate for free with `--dry-run`
 

@@ -34,7 +34,7 @@ for i, (bg, accent) in enumerate(SCREENS):
 
 cmd = [
     sys.executable, str(ROOT / "revyl_gif.py"), str(ROOT / "flows" / "example.yaml"),
-    "--dry-run", "--out", str(tmp), "--fps", "20", "--width", "360",
+    "--dry-run", "--out", str(tmp), "--fps", "20", "--width", "360", "--no-open",
 ]
 print("running:", " ".join(cmd))
 subprocess.run(cmd, check=True, cwd=ROOT)
