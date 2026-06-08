@@ -1,0 +1,18 @@
+{
+  "version": "0.1.0",
+  "name": "device-gif-maker",
+  "description": "Any flow → a clean looping GIF on a pristine device frame, via the Revyl CLI.",
+  "organization": {
+    "name": "Revyl",
+    "url": "https://revyl.com"
+  },
+  "references": [
+    "https://docs.revyl.ai",
+    "https://github.com/RevylAI/mobile-devtools",
+    "https://ffmpeg.org/"
+  ],
+  "keywords": [
+    "gif", "mp4", "device-frame", "mockup", "readme", "demo",
+    "ios", "android", "revyl", "screenshots", "looping", "mobile"
+  ]
+}
