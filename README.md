@@ -45,7 +45,7 @@ a small Python CLI orchestrating `revyl device` commands.
 ## Install
 
 ```bash
-git clone https://github.com/RevylAI/device-gif-maker.git
+git clone https://github.com/ethanzhoucool/device-gif-maker.git
 cd device-gif-maker
 
 pip install -r requirements.txt          # Pillow + PyYAML
