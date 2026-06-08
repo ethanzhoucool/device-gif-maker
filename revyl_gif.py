@@ -16,6 +16,7 @@ Built on the Revyl CLI (`revyl device ...`). See README.md.
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import subprocess
@@ -168,10 +169,15 @@ def step_to_argv(step):
             a += ["--y", str(d["y"])]
         return a
 
-    # No-value flag actions: dispatch on truthiness, not mere presence.
+    # No-value flag actions: dispatch on truthiness, not mere presence. A flag
+    # left falsy (e.g. `back: false` in a template) is recorded but must not
+    # shadow a real action key present in the same step.
+    disabled_flag = False
     for key, cmd in FLAG_ACTIONS.items():
         if key in step:
-            return ["device", cmd] if step[key] else None
+            if step[key]:
+                return ["device", cmd]
+            disabled_flag = True
 
     if "tap" in step:
         return ["device", "tap", *tgt(step["tap"])]
@@ -213,6 +219,8 @@ def step_to_argv(step):
         return ["device", "wait", str(float(step["wait"]) / 1000.0)]
     if "instruction" in step:
         return ["device", "instruction", str(step["instruction"])]
+    if disabled_flag:
+        return None  # only a disabled flag action present -> capture-only no-op
     raise RevylError(f"Unrecognized step (no known action key): {step}")
 
 
@@ -239,9 +247,19 @@ def capture_flow(flow, frames_dir, attach=None, timeout=600, keep=False):
     cap = flow["capture"]
     frames_dir.mkdir(parents=True, exist_ok=True)
 
-    # Translate every step up front so an unknown action key fails fast,
-    # before we provision a (billable, concurrency-limited) device.
-    plan = [(step, step_to_argv(step)) for step in flow["steps"]]
+    out_hold = flow["output"]["hold"]
+    # Translate + validate every step up front so a bad action key or a
+    # non-numeric hold/settle fails fast, before we provision a (billable,
+    # concurrency-limited) device.
+    plan = []
+    for step in flow["steps"]:
+        argv = step_to_argv(step)
+        try:
+            float(step.get("hold", out_hold))
+            float(step.get("settle", cap["settle"]))
+        except (TypeError, ValueError):
+            raise RevylError(f"step has a non-numeric hold/settle: {step}")
+        plan.append((step, argv))
 
     print(f"\n== Capturing flow '{flow['name']}' on a cloud device ==")
     if attach:
@@ -290,11 +308,10 @@ def capture_flow(flow, frames_dir, attach=None, timeout=600, keep=False):
         if not keep and not attach:
             revyl(["device", "stop", "--all"], check=False, quiet=True)
             print("  -> session stopped")
-
-    # Record per-frame hold/label so `--dry-run` can reproduce the exact
-    # timeline without re-driving the device.
-    manifest = [{"file": p.name, "hold": h, "label": lbl} for p, h, lbl in frames]
-    (frames_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        # Always record a manifest (even on error) so whatever frames were
+        # captured can still be re-rendered with `--dry-run`.
+        manifest = [{"file": p.name, "hold": h, "label": lbl} for p, h, lbl in frames]
+        (frames_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
     return frames
 
@@ -489,17 +506,18 @@ _PREVIEW_STYLE = """<style>
 
 
 def _preview_card(path):
-    name = path.name
+    attr = html.escape(path.name, quote=True)   # used inside "..." attributes
+    text = html.escape(path.name)
     meta = _human(path.stat().st_size)
     if path.suffix == ".gif":
-        media = f'<img src="{name}" alt="{name}">'
+        media = f'<img src="{attr}" alt="{attr}">'
         pill = "GIF · loops natively"
     else:
-        media = f'<video src="{name}" autoplay loop muted playsinline controls></video>'
+        media = f'<video src="{attr}" autoplay loop muted playsinline controls></video>'
         pill = "MP4 · autoplay loop"
     return (f'<div class="card"><span class="pill">{pill}</span>'
             f'<div class="frame">{media}</div>'
-            f'<div class="label">{name}</div><div class="meta">{meta}</div></div>')
+            f'<div class="label">{text}</div><div class="meta">{meta}</div></div>')
 
 
 def write_preview(out_dir, flow, outputs, loop_seconds):
@@ -507,14 +525,15 @@ def write_preview(out_dir, flow, outputs, loop_seconds):
     f = flow["frame"]
     cards = "\n      ".join(_preview_card(p) for p in outputs
                             if p.suffix in (".gif", ".mp4"))
-    sub = (f"{f['style']} · {f['color']} · {f['background']} bg · "
-           f"{loop_seconds:.1f}s loop")
-    html = f"""<!doctype html>
+    name = html.escape(str(flow["name"]))
+    sub = html.escape(f"{f['style']} · {f['color']} · {f['background']} bg · "
+                      f"{loop_seconds:.1f}s loop")
+    doc = f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
-<title>{flow['name']} — device-gif-maker</title>
+<title>{name} — device-gif-maker</title>
 {_PREVIEW_STYLE}
 </head><body>
-  <h1>{flow['name']}</h1>
+  <h1>{name}</h1>
   <p class="sub">{sub}</p>
   <div class="row">
       {cards}
@@ -523,7 +542,7 @@ def write_preview(out_dir, flow, outputs, loop_seconds):
 </body></html>
 """
     path = out_dir / "preview.html"
-    path.write_text(html)
+    path.write_text(doc)
     return path
 
 
@@ -653,7 +672,11 @@ def main():
         elif args.open:
             open_it = True
         else:
-            open_it = sys.stdout.isatty()
+            # Auto-open only in an interactive terminal that plausibly has a GUI
+            # (avoids hijacking a headless SSH TTY with a console browser).
+            gui = (sys.platform in ("darwin", "win32")
+                   or os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+            open_it = sys.stdout.isatty() and bool(gui)
         if open_it:
             try:
                 webbrowser.open(preview.resolve().as_uri())
