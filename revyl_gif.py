@@ -30,7 +30,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PIL import Image  # noqa: E402
+from PIL import Image, ImageChops, ImageStat  # noqa: E402
 import device_frame  # noqa: E402
 
 try:
@@ -68,6 +68,9 @@ DEFAULTS = {
         "settle": 0.6,      # seconds to wait after an action before screenshotting
         "launch_settle": 2.5,  # seconds after session start before first screenshot
         "dedup": True,      # merge consecutive identical frames into one longer hold
+        "dedup_threshold": 2.0,  # max mean per-channel diff (0-255) to treat two
+                                 # consecutive screens as the same state; higher =
+                                 # merges more aggressively (0 = only exact matches)
     },
 }
 
@@ -119,6 +122,8 @@ def load_flow(path):
     else:
         spec = json.loads(text)
 
+    if not isinstance(spec, dict):
+        sys.exit(f"{path}: flow file is empty or not a key/value mapping.")
     flow = dict(spec)
     flow["frame"] = _deep_merge(DEFAULTS["frame"], spec.get("frame"))
     flow["output"] = _deep_merge(DEFAULTS["output"], spec.get("output"))
@@ -133,6 +138,10 @@ class DeviceError(RuntimeError):
     """Any failure talking to a device backend (cloud or local sim)."""
 
 
+class RenderError(RuntimeError):
+    """A failure in the framing / ffmpeg-encoding pipeline."""
+
+
 # --------------------------------------------------------------------------- #
 # Cloud backend: the Revyl CLI (`revyl device ...`)
 # --------------------------------------------------------------------------- #
@@ -141,7 +150,11 @@ def revyl(args, *, quiet=False, check=True, capture=True):
     cmd = ["revyl", *args]
     if not quiet:
         print(f"  $ {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=capture, text=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=capture, text=True)
+    except FileNotFoundError:
+        raise DeviceError("`revyl` not found on PATH. Install the Revyl CLI and run "
+                          "`revyl auth login` to use cloud mode (or use `local`).")
     if check and proc.returncode != 0:
         raise DeviceError(
             f"`{' '.join(cmd)}` failed ({proc.returncode}):\n{proc.stderr or proc.stdout}"
@@ -481,6 +494,17 @@ def _write_manifest(frames_dir, frames):
     (frames_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
+def _clear_frames(frames_dir):
+    """Drop stale screenshots + manifest from a previous capture so a shorter
+    new run can't leave orphaned state_*.png that a manifest-less `--dry-run`
+    would later pick up."""
+    for old in frames_dir.glob("state_*.png"):
+        old.unlink()
+    manifest = frames_dir / "manifest.json"
+    if manifest.exists():
+        manifest.unlink()
+
+
 def capture_flow(flow, frames_dir, driver, attach=None, timeout=600, keep=False):
     cap = flow["capture"]
     frames_dir.mkdir(parents=True, exist_ok=True)
@@ -505,6 +529,11 @@ def capture_flow(flow, frames_dir, driver, attach=None, timeout=600, keep=False)
         driver.attach(attach)
     else:
         driver.start(flow, timeout)
+
+    # Only now that validation passed and the device is up do we drop the
+    # previous capture -- a failure before this point leaves the prior frames
+    # intact so they stay re-renderable with --dry-run.
+    _clear_frames(frames_dir)
 
     frames = []  # list of (path, hold, label)
 
@@ -562,6 +591,9 @@ def capture_manual(flow, frames_dir, driver, keep=False, attach=None):
     else:
         driver.start(flow, timeout=flow.get("timeout", 600))
 
+    # Clear the previous capture only after the device is up (see capture_flow).
+    _clear_frames(frames_dir)
+
     print("Drive the app yourself. Press Enter to capture each screen; "
           "type q then Enter to finish.")
     frames = []
@@ -611,29 +643,34 @@ def load_captured(frames_dir, default_hold, use_manifest=True):
 # Compositing + timeline
 # --------------------------------------------------------------------------- #
 
-def _phash(image, size=8):
-    """Tiny average-hash for de-duping near-identical consecutive frames."""
-    small = image.convert("L").resize((size, size), Image.LANCZOS)
-    pixels = list(small.getdata())
-    avg = sum(pixels) / len(pixels)
-    return tuple(1 if p > avg else 0 for p in pixels)
+def _signature(image, size=32):
+    """A small RGB thumbnail used to tell UI states apart for de-dup.
+
+    Color and coarse layout are preserved -- unlike a grayscale average-hash,
+    which collapses screens that share a light/dark layout but differ in
+    content (a recolored accent, a moved row, text you just typed)."""
+    return image.convert("RGB").resize((size, size), Image.LANCZOS)
 
 
-def _hamming(a, b):
-    return sum(x != y for x, y in zip(a, b))
+def _frame_distance(a, b):
+    """Mean absolute per-channel difference (0-255) between two signatures.
+    0 = pixel-identical; small for noise (clock tick, spinner), large for a
+    genuinely different screen."""
+    bands = ImageStat.Stat(ImageChops.difference(a, b)).mean
+    return sum(bands) / len(bands)
 
 
-def composite_states(frames, frame_opts, dedup):
+def composite_states(frames, frame_opts, dedup, threshold=2.0):
     """Frame each captured screenshot; optionally merge identical neighbours."""
     states = []  # list of (PIL RGBA image, hold seconds, label)
-    prev_hash = None
+    prev_sig = None
     for path, hold, label in frames:
         with Image.open(path) as raw:
-            # Hash the raw screenshot, NOT the framed composite -- the bezel and
-            # background are identical across every frame and would otherwise
-            # dominate the hash and merge genuinely distinct UI states.
-            h = _phash(raw)
-            if dedup and prev_hash is not None and _hamming(h, prev_hash) <= 1:
+            # Compare the raw screenshot, NOT the framed composite -- the bezel
+            # and background are identical across every frame and would
+            # otherwise mask genuinely distinct UI states.
+            sig = _signature(raw)
+            if dedup and prev_sig is not None and _frame_distance(sig, prev_sig) <= threshold:
                 # Same UI state: extend the previous hold instead of adding a frame.
                 img, prev_hold, prev_label = states[-1]
                 states[-1] = (img, prev_hold + hold, prev_label)
@@ -648,7 +685,7 @@ def composite_states(frames, frame_opts, dedup):
                 buttons=frame_opts["buttons"],
             )
         states.append((framed, hold, label))
-        prev_hash = h
+        prev_sig = sig
     return states
 
 
@@ -716,6 +753,20 @@ def _matte(value):
 # Encoding (ffmpeg)
 # --------------------------------------------------------------------------- #
 
+def _run_ffmpeg(cmd, what):
+    """Run an ffmpeg command, surfacing its stderr on failure instead of a bare
+    CalledProcessError traceback with the real error swallowed."""
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        raise RenderError("`ffmpeg` not found on PATH. Install it (e.g. "
+                          "`brew install ffmpeg`) to encode the GIF/MP4.")
+    if proc.returncode != 0:
+        tail = "\n  ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-12:])
+        raise RenderError(f"ffmpeg failed while encoding the {what}:\n  {tail}")
+    return proc
+
+
 def encode_gif(seq_dir, fps, out_path, loop):
     pattern = str(seq_dir / "%05d.png")
     vf = ("[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];"
@@ -723,7 +774,7 @@ def encode_gif(seq_dir, fps, out_path, loop):
     # ffmpeg gif: -loop 0 = loop forever, -loop -1 = play once.
     cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", pattern,
            "-filter_complex", vf, "-loop", "0" if loop else "-1", str(out_path)]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    _run_ffmpeg(cmd, "GIF")
 
 
 def encode_mp4(seq_dir, fps, out_path):
@@ -732,7 +783,7 @@ def encode_mp4(seq_dir, fps, out_path):
            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
            "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18",
            "-movflags", "+faststart", str(out_path)]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    _run_ffmpeg(cmd, "MP4")
 
 
 def _human(num_bytes):
@@ -909,11 +960,24 @@ def main():
         sys.exit(f"output.fps must be > 0 (got {o['fps']}).")
     if f["width"] <= 0:
         sys.exit(f"frame.width must be > 0 (got {f['width']}).")
+    try:
+        flow["capture"]["dedup_threshold"] = float(flow["capture"]["dedup_threshold"])
+    except (TypeError, ValueError):
+        sys.exit("capture.dedup_threshold must be a number (got "
+                 f"{flow['capture']['dedup_threshold']!r}).")
     bg = f["background"]
     if (isinstance(bg, str) and not bg.startswith("#")
             and bg not in device_frame.BACKGROUND_PRESETS):
         print(f"  ! unknown background '{bg}'; falling back to 'light'. "
               f"Options: {', '.join(device_frame.BACKGROUND_PRESETS)} or a #hex color.")
+
+    # Preflight: fail with a clear message now, not a raw traceback mid-render.
+    if (o["gif"] or o["mp4"]) and shutil.which("ffmpeg") is None:
+        sys.exit("`ffmpeg` not found on PATH. Install it (e.g. `brew install ffmpeg`), "
+                 "or pass --no-gif --no-mp4.")
+    if mode == "cloud" and not args.dry_run and shutil.which("revyl") is None:
+        sys.exit("`revyl` not found on PATH. Install the Revyl CLI and run "
+                 "`revyl auth login`, or use `local` / --dry-run.")
 
     out_dir = Path(args.out or Path("out") / flow["name"])
     frames_dir = out_dir / "frames"
@@ -940,7 +1004,8 @@ def main():
         sys.exit("No frames captured -- aborting.")
 
     print(f"\n== Framing {len(frames)} states ==")
-    states = composite_states(frames, f, flow["capture"]["dedup"])
+    states = composite_states(frames, f, flow["capture"]["dedup"],
+                              flow["capture"]["dedup_threshold"])
     print(f"  -> {len(states)} distinct states after de-dup")
 
     # 3. render timeline + encode
@@ -950,23 +1015,32 @@ def main():
     print(f"  -> {total} frames at {o['fps']}fps "
           f"({total / o['fps']:.1f}s loop)")
 
+    # Encode each requested format independently so one failing encoder (e.g.
+    # ffmpeg built without libx264 -> MP4 fails) doesn't bury a GIF that already
+    # encoded fine. Surface whatever succeeded, then exit non-zero if any failed.
     outputs = []
-    if o["gif"]:
-        gif_path = out_dir / f"{flow['name']}.gif"
-        print("== Encoding GIF ==")
-        encode_gif(seq_dir, o["fps"], gif_path, o["loop"])
-        outputs.append(gif_path)
-    if o["mp4"]:
-        mp4_path = out_dir / f"{flow['name']}.mp4"
-        print("== Encoding MP4 ==")
-        encode_mp4(seq_dir, o["fps"], mp4_path)
-        outputs.append(mp4_path)
+    encode_error = None
+    for enabled, name, ext, encode in (
+        (o["gif"], "GIF", "gif", lambda p: encode_gif(seq_dir, o["fps"], p, o["loop"])),
+        (o["mp4"], "MP4", "mp4", lambda p: encode_mp4(seq_dir, o["fps"], p)),
+    ):
+        if not enabled:
+            continue
+        path = out_dir / f"{flow['name']}.{ext}"
+        print(f"== Encoding {name} ==")
+        try:
+            encode(path)
+            outputs.append(path)
+        except RenderError as exc:
+            print(f"  ! {exc}")
+            encode_error = exc
 
     # compile a self-contained HTML viewer next to the outputs
     preview = (write_preview(out_dir, flow, outputs, total / o["fps"], source=driver.source,
                              cta=driver.cta, cta_url=driver.cta_url) if outputs else None)
 
-    print("\nDone:")
+    if outputs:
+        print("\nDone:")
     for path in outputs:
         print(f"  {path}  ({_human(path.stat().st_size)})")
     if preview:
@@ -990,6 +1064,12 @@ def main():
 
     if driver.cta:
         print(f"\nTip: {driver.cta}\n     {driver.cta_url}")
+
+    if encode_error:
+        # Frames + manifest are on disk, so re-encoding is free and device-free.
+        skip = "--no-mp4" if "mp4" in str(encode_error).lower() else "--no-gif"
+        sys.exit(f"\nerror: encoding failed -- {encode_error}\n(frames are saved -- "
+                 f"re-run with --dry-run to re-encode, or skip that format with {skip}.)")
 
 
 if __name__ == "__main__":
