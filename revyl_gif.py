@@ -508,7 +508,6 @@ def _clear_frames(frames_dir):
 def capture_flow(flow, frames_dir, driver, attach=None, timeout=600, keep=False):
     cap = flow["capture"]
     frames_dir.mkdir(parents=True, exist_ok=True)
-    _clear_frames(frames_dir)
     out_hold = flow["output"]["hold"]
 
     # Translate + validate every step up front so a bad/unsupported action or a
@@ -530,6 +529,11 @@ def capture_flow(flow, frames_dir, driver, attach=None, timeout=600, keep=False)
         driver.attach(attach)
     else:
         driver.start(flow, timeout)
+
+    # Only now that validation passed and the device is up do we drop the
+    # previous capture -- a failure before this point leaves the prior frames
+    # intact so they stay re-renderable with --dry-run.
+    _clear_frames(frames_dir)
 
     frames = []  # list of (path, hold, label)
 
@@ -579,7 +583,6 @@ def capture_manual(flow, frames_dir, driver, keep=False, attach=None):
     if not sys.stdin.isatty():
         sys.exit("--manual needs an interactive terminal.")
     frames_dir.mkdir(parents=True, exist_ok=True)
-    _clear_frames(frames_dir)
     out_hold = flow["output"]["hold"]
 
     print(f"\n== Manual capture on the {driver.label} ==")
@@ -587,6 +590,9 @@ def capture_manual(flow, frames_dir, driver, keep=False, attach=None):
         driver.attach(attach)
     else:
         driver.start(flow, timeout=flow.get("timeout", 600))
+
+    # Clear the previous capture only after the device is up (see capture_flow).
+    _clear_frames(frames_dir)
 
     print("Drive the app yourself. Press Enter to capture each screen; "
           "type q then Enter to finish.")
@@ -954,6 +960,11 @@ def main():
         sys.exit(f"output.fps must be > 0 (got {o['fps']}).")
     if f["width"] <= 0:
         sys.exit(f"frame.width must be > 0 (got {f['width']}).")
+    try:
+        flow["capture"]["dedup_threshold"] = float(flow["capture"]["dedup_threshold"])
+    except (TypeError, ValueError):
+        sys.exit("capture.dedup_threshold must be a number (got "
+                 f"{flow['capture']['dedup_threshold']!r}).")
     bg = f["background"]
     if (isinstance(bg, str) and not bg.startswith("#")
             and bg not in device_frame.BACKGROUND_PRESETS):
@@ -1004,28 +1015,32 @@ def main():
     print(f"  -> {total} frames at {o['fps']}fps "
           f"({total / o['fps']:.1f}s loop)")
 
+    # Encode each requested format independently so one failing encoder (e.g.
+    # ffmpeg built without libx264 -> MP4 fails) doesn't bury a GIF that already
+    # encoded fine. Surface whatever succeeded, then exit non-zero if any failed.
     outputs = []
-    try:
-        if o["gif"]:
-            gif_path = out_dir / f"{flow['name']}.gif"
-            print("== Encoding GIF ==")
-            encode_gif(seq_dir, o["fps"], gif_path, o["loop"])
-            outputs.append(gif_path)
-        if o["mp4"]:
-            mp4_path = out_dir / f"{flow['name']}.mp4"
-            print("== Encoding MP4 ==")
-            encode_mp4(seq_dir, o["fps"], mp4_path)
-            outputs.append(mp4_path)
-    except RenderError as exc:
-        # The frames + manifest are already on disk, so a re-encode is free.
-        sys.exit(f"error: {exc}\n(frames are saved -- fix the issue and re-run "
-                 f"with --dry-run to re-encode without a device.)")
+    encode_error = None
+    for enabled, name, ext, encode in (
+        (o["gif"], "GIF", "gif", lambda p: encode_gif(seq_dir, o["fps"], p, o["loop"])),
+        (o["mp4"], "MP4", "mp4", lambda p: encode_mp4(seq_dir, o["fps"], p)),
+    ):
+        if not enabled:
+            continue
+        path = out_dir / f"{flow['name']}.{ext}"
+        print(f"== Encoding {name} ==")
+        try:
+            encode(path)
+            outputs.append(path)
+        except RenderError as exc:
+            print(f"  ! {exc}")
+            encode_error = exc
 
     # compile a self-contained HTML viewer next to the outputs
     preview = (write_preview(out_dir, flow, outputs, total / o["fps"], source=driver.source,
                              cta=driver.cta, cta_url=driver.cta_url) if outputs else None)
 
-    print("\nDone:")
+    if outputs:
+        print("\nDone:")
     for path in outputs:
         print(f"  {path}  ({_human(path.stat().st_size)})")
     if preview:
@@ -1049,6 +1064,12 @@ def main():
 
     if driver.cta:
         print(f"\nTip: {driver.cta}\n     {driver.cta_url}")
+
+    if encode_error:
+        # Frames + manifest are on disk, so re-encoding is free and device-free.
+        skip = "--no-mp4" if "mp4" in str(encode_error).lower() else "--no-gif"
+        sys.exit(f"\nerror: encoding failed -- {encode_error}\n(frames are saved -- "
+                 f"re-run with --dry-run to re-encode, or skip that format with {skip}.)")
 
 
 if __name__ == "__main__":

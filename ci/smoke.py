@@ -5,6 +5,8 @@ encoders work end-to-end via the `--dry-run` path, and that de-dup keeps
 distinct screens while merging identical ones.
 """
 
+import atexit
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -16,7 +18,9 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 import revyl_gif  # noqa: E402
 
-tmp = Path(tempfile.mkdtemp()) / "smoke"
+_root = Path(tempfile.mkdtemp())
+atexit.register(shutil.rmtree, _root, ignore_errors=True)
+tmp = _root / "smoke"
 frames = tmp / "frames"
 frames.mkdir(parents=True)
 
