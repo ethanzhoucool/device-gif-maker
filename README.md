@@ -4,7 +4,7 @@
 
 Drop a few steps in a YAML file, point it at your app, and get back a polished,
 seamlessly-looping GIF (and an MP4) of the flow running on a **cloud
-device**  framed in a clean phone mockup, ready for a README or a tweet.
+device**, framed in a clean phone mockup, ready for a README or a tweet.
 
 No screen recorder, no Figma, no After Effects, no mockup PNGs. Just the
 [Revyl CLI](https://docs.revyl.ai) + `ffmpeg`, or a local iOS simulator (see
@@ -146,6 +146,8 @@ capture:
   initial: true            # capture the opening state before step 1
   settle: 0.6              # seconds to wait after each action before screenshotting
   dedup: true              # merge identical consecutive states into one longer hold
+  dedup_threshold: 2.0     # how alike two screens must be to merge (mean per-channel
+                           # diff, 0-255). Lower = stricter (more states kept).
 
 steps:
   - tap: { target: "Search tab" }
