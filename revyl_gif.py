@@ -794,9 +794,10 @@ def _run_ffmpeg(cmd, what):
 # One global palette weighted towards what changes between frames, mapped with
 # an ordered (Bayer) dither: unlike error diffusion it's deterministic per
 # pixel, so regions that don't change between frames stay byte-identical and
-# the GIF encoder can skip them.
+# the GIF encoder can skip them. bayer_scale=5 is ffmpeg's finest pattern: a
+# fainter crosshatch than 3, measurably closer to the source, and smaller.
 GIF_FILTER = ("[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];"
-              "[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle")
+              "[b][p]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle")
 
 # Browsers play a GIF frame delay of 0 or 1 centisecond as ~10cs, so never
 # write anything shorter than this.
