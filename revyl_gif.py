@@ -633,7 +633,7 @@ def capture_flow(flow, frames_dir, driver, attach=None, timeout=600, keep=False)
     return frames
 
 
-def capture_manual(flow, frames_dir, driver, keep=False, attach=None):
+def capture_manual(flow, frames_dir, driver, keep=False, attach=None, timeout=600):
     """Interactive capture: you drive the device, press Enter to grab each
     screen. The natural fit for a local simulator (no UI automation needed)."""
     if not sys.stdin.isatty():
@@ -645,7 +645,7 @@ def capture_manual(flow, frames_dir, driver, keep=False, attach=None):
     if attach and driver.supports_attach:
         driver.attach(attach)
     else:
-        driver.start(flow, timeout=flow.get("timeout", 600))
+        driver.start(flow, timeout)
 
     # Clear the previous capture only after the device is up (see capture_flow).
     _clear_frames(frames_dir)
@@ -952,7 +952,9 @@ def main():
                    help="Flow spec (.yaml/.yml/.json). Optional in `local` mode.")
     p.add_argument("--out", default=None, help="Output directory (default: ./out/<name>)")
     p.add_argument("--attach", help="Attach to an existing cloud session id")
-    p.add_argument("--timeout", type=int, default=600, help="Cloud session idle timeout (s)")
+    p.add_argument("--timeout", type=int, default=None,
+                   help="Cloud session idle timeout in seconds (default: the flow's "
+                        "`timeout`, else 600)")
     p.add_argument("--keep-session", action="store_true",
                    help="Don't stop the cloud session when done")
     p.add_argument("--manual", action="store_true",
@@ -1045,6 +1047,8 @@ def main():
         sys.exit("`revyl` not found on PATH. Install the Revyl CLI and run "
                  "`revyl auth login`, or use `local` / --dry-run.")
 
+    timeout = args.timeout if args.timeout is not None else flow.get("timeout", 600)
+
     out_dir = Path(args.out or Path("out") / flow["name"])
     frames_dir = out_dir / "frames"
     seq_dir = out_dir / "seq"
@@ -1059,11 +1063,11 @@ def main():
             # An explicit --hold means "uniform hold"; else honour the manifest.
             frames = load_captured(frames_dir, o["hold"], use_manifest=(args.hold is None))
         elif args.manual or (mode == "local" and not flow["steps"]):
-            frames = capture_manual(flow, frames_dir, driver,
-                                    keep=args.keep_session, attach=args.attach)
+            frames = capture_manual(flow, frames_dir, driver, keep=args.keep_session,
+                                    attach=args.attach, timeout=timeout)
         else:
             frames = capture_flow(flow, frames_dir, driver, attach=args.attach,
-                                  timeout=args.timeout, keep=args.keep_session)
+                                  timeout=timeout, keep=args.keep_session)
     except DeviceError as exc:
         sys.exit(f"error: {exc}")
     if not frames:
