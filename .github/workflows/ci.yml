@@ -19,3 +19,9 @@ jobs:
         run: pip install -r requirements.txt
       - name: Render smoke test (synthetic frames, no device)
         run: python ci/smoke.py
+      - name: Launcher works when symlinked onto PATH (README install step)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bin dir"
+          ln -s "$PWD/revyl-gif" "$RUNNER_TEMP/bin dir/revyl-gif"
+          cd "$RUNNER_TEMP"
+          PATH="$RUNNER_TEMP/bin dir:$PATH" revyl-gif --help

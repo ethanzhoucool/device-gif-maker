@@ -1,3 +1,12 @@
 #!/usr/bin/env bash
 # Thin launcher so you can run `./revyl-gif ...` (or symlink it onto your PATH).
-exec python3 "$(dirname "$0")/revyl_gif.py" "$@"
+# Resolve symlinks first: when run as a symlink (e.g. /usr/local/bin/revyl-gif)
+# $0 is the link, and revyl_gif.py lives next to the real file, not the link.
+unset CDPATH  # keep `cd` silent so $(cd ... && pwd) is just the path
+src="$0"
+while [ -L "$src" ]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  case "$src" in /*) ;; *) src="$dir/$src" ;; esac
+done
+exec python3 "$(cd -P "$(dirname "$src")" && pwd)/revyl_gif.py" "$@"
