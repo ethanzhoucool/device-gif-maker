@@ -37,7 +37,9 @@ a small Python CLI orchestrating `revyl device` commands.
    clean background.
 4. **Loop**: builds a smooth timeline (per-state holds + crossfade tweens +
    a seamless crossfade from the last state back to the first) and encodes a
-   high-quality GIF (ffmpeg `palettegen`/`paletteuse`) plus an MP4.
+   high-quality GIF (ffmpeg `palettegen`/`paletteuse`) plus an MP4. In the GIF,
+   each held state is a single frame with an exact delay, so holds cost
+   almost nothing; the crossfade frames are what make up most of the file size.
 
 > The capture primitive is `revyl device screenshot`, so the GIF is a polished
 > **state-to-state** loop, one frame per UI state, held and crossfaded, not a
@@ -97,6 +99,12 @@ revyl-gif flows/example.yaml --dry-run --color silver --background midnight --ho
 Per-state holds and labels are restored from the capture's
 `frames/manifest.json`, so a re-render's timing matches the live run. Pass an
 explicit `--hold` to flatten every state to a single duration instead.
+
+**Smaller GIF?** Nearly all of a GIF's bytes are its crossfade frames, so the
+frame rate is the main size knob: `--fps 15` renders half as many crossfade
+frames (GIF and MP4) with the same hold timing. On a 4-state flow at the
+default settings it took the GIF from ~5.7 MB to ~3.3 MB. A shorter `--xfade`
+helps the same way.
 
 ### Local simulator (`local`)
 

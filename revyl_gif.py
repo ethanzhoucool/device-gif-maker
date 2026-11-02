@@ -689,8 +689,26 @@ def composite_states(frames, frame_opts, dedup, threshold=2.0):
     return states
 
 
+def _link_or_copy(src, dst):
+    """Hard-link `dst` to `src`, or copy the bytes where links aren't allowed."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copyfile(src, dst)
+
+
 def build_sequence(states, out_dir, fps, xfade, loop, pingpong, matte):
-    """Render the full PNG frame sequence (holds + crossfades) for ffmpeg."""
+    """Render the full PNG frame sequence (holds + crossfades) for ffmpeg.
+
+    `out_dir` ends up holding every frame of the timeline at `fps`
+    (00000.png, 00001.png, ...), but each distinct image is PNG-encoded only
+    once: the repeated frames of a hold are hard links to (or byte copies of)
+    the first one.
+
+    Returns the timeline as runs of identical frames, `[(first, count), ...]`
+    in playback order, so the total frame count is `sum(count)` and the GIF
+    encoder can emit one frame per run with the right delay.
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     # Clear any stale frames from a previous render so ffmpeg's sequential
     # %05d reader can't pick up leftovers when the new render is shorter.
@@ -717,19 +735,25 @@ def build_sequence(states, out_dir, fps, xfade, loop, pingpong, matte):
     if pingpong and len(flat) > 2:
         order += list(range(len(flat) - 2, 0, -1))
 
+    runs = []  # (first frame index, number of identical frames)
     n = 0
 
-    def write(img):
+    def write(img, count=1):
         nonlocal n
-        img.save(out_dir / f"{n:05d}.png")
-        n += 1
+        path = out_dir / f"{n:05d}.png"
+        # These PNGs are scratch input for ffmpeg: favour encode speed over
+        # file size (level 1 is ~2x faster than Pillow's default 6).
+        img.save(path, compress_level=1)
+        for k in range(1, count):
+            _link_or_copy(path, out_dir / f"{n + k:05d}.png")
+        runs.append((n, count))
+        n += count
 
     xfade_frames = max(0, int(round(xfade * fps)))
 
     for pos, si in enumerate(order):
         img, hold = flat[si]
-        for _ in range(max(1, int(round(hold * fps)))):
-            write(img)
+        write(img, max(1, int(round(hold * fps))))
         # crossfade into the next state in the order
         nxt = order[pos + 1] if pos + 1 < len(order) else (order[0] if loop else None)
         if nxt is not None and xfade_frames and nxt != si:
@@ -737,7 +761,7 @@ def build_sequence(states, out_dir, fps, xfade, loop, pingpong, matte):
             for k in range(1, xfade_frames + 1):
                 write(Image.blend(img, target, k / (xfade_frames + 1)))
 
-    return n
+    return runs
 
 
 def _matte(value):
@@ -767,14 +791,106 @@ def _run_ffmpeg(cmd, what):
     return proc
 
 
-def encode_gif(seq_dir, fps, out_path, loop):
-    pattern = str(seq_dir / "%05d.png")
-    vf = ("[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];"
-          "[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle")
+# One global palette weighted towards what changes between frames, mapped with
+# an ordered (Bayer) dither: unlike error diffusion it's deterministic per
+# pixel, so regions that don't change between frames stay byte-identical and
+# the GIF encoder can skip them.
+GIF_FILTER = ("[0:v]split[a][b];[a]palettegen=stats_mode=diff[p];"
+              "[b][p]paletteuse=dither=bayer:bayer_scale=3:diff_mode=rectangle")
+
+# Browsers play a GIF frame delay of 0 or 1 centisecond as ~10cs, so never
+# write anything shorter than this.
+GIF_MIN_DELAY_CS = 2
+
+
+def _gif_delays(runs, fps):
+    """GIF frame delays (centiseconds) for one frame per run of identical frames.
+
+    Rounds the cumulative timeline rather than each frame, so the loop length
+    doesn't drift, and never goes below GIF_MIN_DELAY_CS (only reachable above
+    50 fps; later frames are shortened to catch up where they can).
+    """
+    delays, shown = [], 0
+    for first, count in runs:
+        end = round((first + count) * 100 / fps)
+        delay = max(GIF_MIN_DELAY_CS, end - shown)
+        delays.append(delay)
+        shown += delay
+    return delays
+
+
+def _skip_gif_sub_blocks(data, pos):
+    while data[pos]:
+        pos += data[pos] + 1
+    return pos + 1
+
+
+def _set_gif_delays(path, delays):
+    """Rewrite the per-frame delays in the GIF at `path`, in place.
+
+    Raises ValueError if the file doesn't have exactly one graphic control
+    extension per frame, `len(delays)` frames in all.
+    """
+    data = bytearray(Path(path).read_bytes())
+    if data[:6] not in (b"GIF87a", b"GIF89a"):
+        raise ValueError("not a GIF")
+    pos = 13
+    if data[10] & 0x80:  # global color table
+        pos += 3 << ((data[10] & 7) + 1)
+    slots, gce = [], None
+    while True:
+        block = data[pos]
+        if block == 0x21:  # extension
+            if data[pos + 1] == 0xF9:  # graphic control: delay at bytes 4-5
+                gce = pos + 4
+            pos = _skip_gif_sub_blocks(data, pos + 2)
+        elif block == 0x2C:  # image descriptor
+            if gce is None:
+                raise ValueError("frame without a graphic control extension")
+            slots.append(gce)
+            gce = None
+            packed = data[pos + 9]
+            pos += 10
+            if packed & 0x80:  # local color table
+                pos += 3 << ((packed & 7) + 1)
+            pos = _skip_gif_sub_blocks(data, pos + 1)  # +1: LZW code size
+        elif block == 0x3B:  # trailer
+            break
+        else:
+            raise ValueError(f"unexpected GIF block 0x{block:02x}")
+    if len(slots) != len(delays):
+        raise ValueError(f"GIF has {len(slots)} frames, expected {len(delays)}")
+    for off, delay in zip(slots, delays):
+        data[off:off + 2] = int(delay).to_bytes(2, "little")
+    Path(path).write_bytes(bytes(data))
+
+
+def encode_gif(seq_dir, fps, out_path, loop, runs=None):
+    """Encode the sequence in `seq_dir` as a GIF.
+
+    With `runs` (from build_sequence), each run of identical frames -- a held
+    state -- becomes a single GIF frame with the matching delay instead of
+    `hold * fps` copies: same picture and timing, a fraction of the frames to
+    palette-map, encode and decode.
+    """
     # ffmpeg gif: -loop 0 = loop forever, -loop -1 = play once.
-    cmd = ["ffmpeg", "-y", "-framerate", str(fps), "-i", pattern,
-           "-filter_complex", vf, "-loop", "0" if loop else "-1", str(out_path)]
-    _run_ffmpeg(cmd, "GIF")
+    tail = ["-filter_complex", GIF_FILTER, "-loop", "0" if loop else "-1", str(out_path)]
+    if runs:
+        # One entry per distinct frame. The placeholder 1s durations just keep
+        # timestamps unique (so ffmpeg emits every frame); the real delays are
+        # written into the GIF afterwards.
+        listing = seq_dir / "gif.ffconcat"
+        listing.write_text("ffconcat version 1.0\n" + "".join(
+            f"file '{first:05d}.png'\nduration 1\n" for first, _ in runs))
+        _run_ffmpeg(["ffmpeg", "-y", "-f", "concat", "-i", str(listing), *tail], "GIF")
+        try:
+            _set_gif_delays(out_path, _gif_delays(runs, fps))
+            return
+        except (ValueError, IndexError) as exc:
+            print(f"  ! couldn't set per-frame GIF delays ({exc}); "
+                  f"encoding every frame instead")
+    pattern = str(seq_dir / "%05d.png")
+    _run_ffmpeg(["ffmpeg", "-y", "-framerate", str(fps), "-i", pattern, *tail], "GIF")
 
 
 def encode_mp4(seq_dir, fps, out_path):
@@ -1010,10 +1126,11 @@ def main():
 
     # 3. render timeline + encode
     print("== Rendering timeline ==")
-    total = build_sequence(states, seq_dir, o["fps"], o["xfade"],
-                           o["loop"], o["pingpong"], o["matte"])
+    runs = build_sequence(states, seq_dir, o["fps"], o["xfade"],
+                          o["loop"], o["pingpong"], o["matte"])
+    total = sum(count for _, count in runs)
     print(f"  -> {total} frames at {o['fps']}fps "
-          f"({total / o['fps']:.1f}s loop)")
+          f"({total / o['fps']:.1f}s loop, {len(runs)} distinct)")
 
     # Encode each requested format independently so one failing encoder (e.g.
     # ffmpeg built without libx264 -> MP4 fails) doesn't bury a GIF that already
@@ -1021,7 +1138,7 @@ def main():
     outputs = []
     encode_error = None
     for enabled, name, ext, encode in (
-        (o["gif"], "GIF", "gif", lambda p: encode_gif(seq_dir, o["fps"], p, o["loop"])),
+        (o["gif"], "GIF", "gif", lambda p: encode_gif(seq_dir, o["fps"], p, o["loop"], runs)),
         (o["mp4"], "MP4", "mp4", lambda p: encode_mp4(seq_dir, o["fps"], p)),
     ):
         if not enabled:

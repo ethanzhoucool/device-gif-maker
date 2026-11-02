@@ -81,3 +81,26 @@ mp4 = tmp / "search-and-play.mp4"
 assert gif.exists() and gif.stat().st_size > 0, "GIF was not produced"
 assert mp4.exists() and mp4.stat().st_size > 0, "MP4 was not produced"
 print(f"OK  gif={gif.stat().st_size}B  mp4={mp4.stat().st_size}B")
+
+# --- GIF timing: one frame per held state / crossfade step, exact loop length ---
+# 4 states x (1.3s hold = 26 frames + 0.45s crossfade = 9 frames) at 20fps:
+# 140 timeline frames = 7.0s, but only 4 + 4 * 9 = 40 distinct GIF frames.
+seq_frames = len(list((tmp / "seq").glob("*.png")))
+assert seq_frames == 140, f"expected 140 timeline frames, got {seq_frames}"
+with Image.open(gif) as im:
+    delays = []
+    for i in range(im.n_frames):
+        im.seek(i)
+        delays.append(im.info["duration"])
+assert len(delays) == 40, f"expected 40 GIF frames (holds collapsed), got {len(delays)}"
+assert sum(delays) == 7000, f"GIF loop is {sum(delays)}ms, expected 7000ms"
+assert delays.count(1300) == 4, f"each held state should be one 1.3s frame: {delays}"
+print(f"OK  gif timing: {len(delays)} frames for {seq_frames} timeline frames, {sum(delays)}ms loop")
+
+# Above 50fps a GIF can't express the per-frame delay (browsers slow 0-1cs
+# frames down to ~10cs), so delays are clamped to 2cs and the loop length kept.
+runs = [(0, 84)] + [(84 + k, 1) for k in range(27)] + [(111, 72)]
+d60 = revyl_gif._gif_delays(runs, 60)
+assert min(d60) >= 2 and sum(d60) == round(183 * 100 / 60), d60
+assert revyl_gif._gif_delays([(0, 26), (26, 1), (27, 1)], 20) == [130, 5, 5]
+print("OK  gif delays never drop below 2cs and keep the loop length")
