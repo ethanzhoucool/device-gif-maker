@@ -53,9 +53,21 @@ pip install -r requirements.txt          # Pillow + PyYAML
 brew install ffmpeg                       # if you don't have it
 revyl auth login                          # authenticate the Revyl CLI
 
-# optional: put it on your PATH
+# optional: put `revyl-gif` on your PATH, either as an isolated install…
+pipx install .
+# …or by linking the launcher (runs straight from the clone)
 ln -s "$PWD/revyl-gif" /usr/local/bin/revyl-gif
 ```
+
+Just want the command, without cloning?
+
+```bash
+pipx install git+https://github.com/ethanzhoucool/device-gif-maker.git
+```
+
+That installs `revyl-gif` and its Python dependencies. You still need `ffmpeg`,
+the Revyl CLI, and a flow file ([`flows/example.yaml`](flows/example.yaml) is a
+good start).
 
 ## Usage
 

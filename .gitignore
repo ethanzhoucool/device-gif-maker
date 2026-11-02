@@ -11,3 +11,8 @@ venv/
 
 # macOS
 .DS_Store
+
+# Packaging
+build/
+dist/
+*.egg-info/

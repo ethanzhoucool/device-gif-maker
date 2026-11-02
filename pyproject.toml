@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "device-gif-maker"
+version = "0.1.0"
+description = "Any flow → a clean looping GIF on a pristine device frame, via the Revyl CLI."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.9"
+dependencies = ["Pillow>=10.0", "PyYAML>=6.0"]
+keywords = ["gif", "mp4", "device-frame", "mockup", "readme", "demo", "ios", "android",
+            "revyl", "screenshots", "looping", "mobile"]
+
+[project.urls]
+Homepage = "https://github.com/ethanzhoucool/device-gif-maker"
+
+[project.scripts]
+revyl-gif = "revyl_gif:main"
+
+[tool.setuptools]
+py-modules = ["revyl_gif", "device_frame"]
