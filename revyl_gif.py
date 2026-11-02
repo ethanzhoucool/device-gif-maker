@@ -114,23 +114,55 @@ def default_flow(name):
 
 
 def load_flow(path):
-    text = Path(path).read_text()
-    if path.endswith((".yaml", ".yml")):
+    """Load + validate a flow file. Problems exit with a one-line message
+    (never a traceback), before any device is provisioned."""
+    path = str(path)
+    try:
+        text = Path(path).read_text()
+    except FileNotFoundError:
+        sys.exit(f"Flow file not found: {path}")
+    except OSError as exc:
+        sys.exit(f"Can't read flow file {path}: {exc.strerror or exc}")
+    if path.lower().endswith((".yaml", ".yml")):
         if yaml is None:
             sys.exit("PyYAML not installed; use a .json flow or `pip install pyyaml`.")
-        spec = yaml.safe_load(text)
+        try:
+            spec = yaml.safe_load(text)
+        except yaml.YAMLError as exc:
+            sys.exit(f"{path}: invalid YAML: {exc}")
     else:
-        spec = json.loads(text)
+        try:
+            spec = json.loads(text)
+        except json.JSONDecodeError as exc:
+            sys.exit(f"{path}: invalid JSON: {exc}")
 
     if not isinstance(spec, dict):
         sys.exit(f"{path}: flow file is empty or not a key/value mapping.")
+    for section in ("app", "frame", "output", "capture"):
+        if spec.get(section) is not None and not isinstance(spec[section], dict):
+            sys.exit(f"{path}: `{section}` must be a key/value mapping "
+                     f"(got {spec[section]!r}).")
+    steps = spec.get("steps")
+    if steps is None:  # `steps:` left empty
+        steps = []
+    if not isinstance(steps, list):
+        sys.exit(f"{path}: `steps` must be a list (got {steps!r}).")
+    for i, step in enumerate(steps, 1):
+        if not isinstance(step, dict):
+            sys.exit(f"{path}: step {i} must be a mapping like "
+                     f"`- tap: {{ target: \"Sign In\" }}` (got {step!r}).")
+
     flow = dict(spec)
+    flow["steps"] = steps
+    flow["app"] = spec.get("app") or {}
     flow["frame"] = _deep_merge(DEFAULTS["frame"], spec.get("frame"))
     flow["output"] = _deep_merge(DEFAULTS["output"], spec.get("output"))
     flow["capture"] = _deep_merge(DEFAULTS["capture"], spec.get("capture"))
     flow.setdefault("platform", DEFAULTS["platform"])
-    flow.setdefault("steps", [])
-    flow.setdefault("name", Path(path).stem)
+    flow["name"] = str(flow.get("name") or Path(path).stem)
+    if "/" in flow["name"] or "\\" in flow["name"]:
+        sys.exit(f"{path}: `name` is used as the output file name, so it can't "
+                 f"contain a slash (got {flow['name']!r}).")
     return flow
 
 
@@ -197,6 +229,31 @@ def revyl_screenshot(out_path, retries=2):
     return False
 
 
+def _step_options(step, action):
+    """The options mapping of a step's action, e.g. step["tap"] -> {target: ..}."""
+    d = step[action]
+    if not isinstance(d, dict):
+        raise DeviceError(f"`{action}` takes a mapping like {{ target: \"...\" }} or "
+                          f"{{ x: 100, y: 200 }} (got {d!r}) in step {step}")
+    return d
+
+
+def _drag_coords(d):
+    try:
+        return tuple(str(d[k]) for k in ("start_x", "start_y", "end_x", "end_y"))
+    except KeyError as exc:
+        raise DeviceError(f"`drag` needs start_x, start_y, end_x and end_y "
+                          f"(missing {exc}): {d}") from None
+
+
+def _wait_seconds(step):
+    try:
+        return float(step["wait"]) / 1000.0
+    except (TypeError, ValueError):
+        raise DeviceError(f"`wait` takes milliseconds as a number "
+                          f"(got {step['wait']!r})") from None
+
+
 def step_to_argv(step):
     """Translate one flow step into `revyl device ...` arguments (cloud mode).
 
@@ -215,6 +272,9 @@ def step_to_argv(step):
             a += ["--y", str(d["y"])]
         return a
 
+    def opts(key):
+        return _step_options(step, key)
+
     disabled_flag = False
     for key, cmd in FLAG_ACTIONS.items():
         if key in step:
@@ -223,29 +283,28 @@ def step_to_argv(step):
             disabled_flag = True
 
     if "tap" in step:
-        return ["device", "tap", *tgt(step["tap"])]
+        return ["device", "tap", *tgt(opts("tap"))]
     if "double_tap" in step:
-        return ["device", "double-tap", *tgt(step["double_tap"])]
+        return ["device", "double-tap", *tgt(opts("double_tap"))]
     if "long_press" in step:
-        d = step["long_press"]
+        d = opts("long_press")
         extra = ["--duration", str(d["duration"])] if "duration" in d else []
         return ["device", "long-press", *tgt(d), *extra]
     if "type" in step:
-        d = step["type"]
+        d = opts("type")
         return ["device", "type", *tgt(d), "--text", str(d.get("text", ""))]
     if "clear_text" in step:
-        return ["device", "clear-text", *tgt(step["clear_text"])]
+        return ["device", "clear-text", *tgt(opts("clear_text"))]
     if "swipe" in step:
-        d = step["swipe"]
+        d = opts("swipe")
         extra = ["--direction", str(d["direction"])] if "direction" in d else []
         return ["device", "swipe", *tgt(d), *extra]
     if "drag" in step:
-        d = step["drag"]
+        sx, sy, ex, ey = _drag_coords(opts("drag"))
         return ["device", "drag",
-                "--start-x", str(d["start_x"]), "--start-y", str(d["start_y"]),
-                "--end-x", str(d["end_x"]), "--end-y", str(d["end_y"])]
+                "--start-x", sx, "--start-y", sy, "--end-x", ex, "--end-y", ey]
     if "pinch" in step:
-        d = step["pinch"]
+        d = opts("pinch")
         extra = ["--scale", str(d["scale"])] if "scale" in d else []
         return ["device", "pinch", *tgt(d), *extra]
     if "navigate" in step:
@@ -259,7 +318,7 @@ def step_to_argv(step):
     if "wait" in step:
         # `wait` is always milliseconds (matches the README); `revyl device
         # wait` takes seconds.
-        return ["device", "wait", str(float(step["wait"]) / 1000.0)]
+        return ["device", "wait", str(_wait_seconds(step))]
     if "instruction" in step:
         return ["device", "instruction", str(step["instruction"])]
     if disabled_flag:
@@ -391,27 +450,24 @@ def sim_translate(step, bundle):
     if "launch" in step:
         return ("launch", str(step["launch"]))
     if "wait" in step:
-        return ("wait", float(step["wait"]) / 1000.0)
+        return ("wait", _wait_seconds(step))
     if "tap" in step:
-        x, y = _sim_coords(step["tap"], "tap")
+        x, y = _sim_coords(_step_options(step, "tap"), "tap")
         return ("idb", ["ui", "tap", x, y])
     if "double_tap" in step:
-        x, y = _sim_coords(step["double_tap"], "double_tap")
+        x, y = _sim_coords(_step_options(step, "double_tap"), "double_tap")
         return ("idb2", ["ui", "tap", x, y])
     if "long_press" in step:
-        d = step["long_press"]
+        d = _step_options(step, "long_press")
         x, y = _sim_coords(d, "long_press")
         return ("idb", ["ui", "tap", "--duration", str(d.get("duration", 1.0)), x, y])
     if "drag" in step:
-        d = step["drag"]
-        return ("idb", ["ui", "swipe",
-                        str(d["start_x"]), str(d["start_y"]),
-                        str(d["end_x"]), str(d["end_y"])])
+        return ("idb", ["ui", "swipe", *_drag_coords(_step_options(step, "drag"))])
     if "swipe" in step:
         raise DeviceError("local mode: use `drag` with explicit start/end coords "
                           "instead of `swipe` (no NL grounding locally)")
     if "type" in step:
-        return ("idb", ["ui", "text", str(step["type"].get("text", ""))])
+        return ("idb", ["ui", "text", str(_step_options(step, "type").get("text", ""))])
     if "instruction" in step:
         raise DeviceError("natural-language `instruction` needs the cloud (Revyl) "
                           "backend; not available on a local simulator")
@@ -759,8 +815,9 @@ def _run_ffmpeg(cmd, what):
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True)
     except FileNotFoundError:
-        raise RenderError("`ffmpeg` not found on PATH. Install it (e.g. "
-                          "`brew install ffmpeg`) to encode the GIF/MP4.")
+        raise RenderError("`ffmpeg` not found on PATH. Install it (macOS: "
+                          "`brew install ffmpeg`, Debian/Ubuntu: `sudo apt install "
+                          "ffmpeg`) to encode the GIF/MP4.")
     if proc.returncode != 0:
         tail = "\n  ".join((proc.stderr or proc.stdout or "").strip().splitlines()[-12:])
         raise RenderError(f"ffmpeg failed while encoding the {what}:\n  {tail}")
@@ -955,11 +1012,20 @@ def main():
     if args.no_mp4:
         o["mp4"] = False
 
-    # validate the values that would otherwise blow up mid-render
-    if o["fps"] <= 0:
-        sys.exit(f"output.fps must be > 0 (got {o['fps']}).")
-    if f["width"] <= 0:
-        sys.exit(f"frame.width must be > 0 (got {f['width']}).")
+    # validate the values that would otherwise blow up mid-render (or, for
+    # the capture timings, mid-capture on a device you're already paying for)
+    for name, value, positive in (
+        ("output.fps", o["fps"], True),
+        ("frame.width", f["width"], True),
+        ("output.hold", o["hold"], False),
+        ("output.xfade", o["xfade"], False),
+        ("capture.settle", flow["capture"]["settle"], False),
+        ("capture.launch_settle", flow["capture"]["launch_settle"], False),
+    ):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            sys.exit(f"{name} must be a number (got {value!r}).")
+        if value < 0 or (positive and value == 0):
+            sys.exit(f"{name} must be {'> 0' if positive else '>= 0'} (got {value}).")
     try:
         flow["capture"]["dedup_threshold"] = float(flow["capture"]["dedup_threshold"])
     except (TypeError, ValueError):
@@ -973,8 +1039,8 @@ def main():
 
     # Preflight: fail with a clear message now, not a raw traceback mid-render.
     if (o["gif"] or o["mp4"]) and shutil.which("ffmpeg") is None:
-        sys.exit("`ffmpeg` not found on PATH. Install it (e.g. `brew install ffmpeg`), "
-                 "or pass --no-gif --no-mp4.")
+        sys.exit("`ffmpeg` not found on PATH. Install it (macOS: `brew install ffmpeg`, "
+                 "Debian/Ubuntu: `sudo apt install ffmpeg`), or pass --no-gif --no-mp4.")
     if mode == "cloud" and not args.dry_run and shutil.which("revyl") is None:
         sys.exit("`revyl` not found on PATH. Install the Revyl CLI and run "
                  "`revyl auth login`, or use `local` / --dry-run.")
