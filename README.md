@@ -125,12 +125,15 @@ app:
 
 # device_model: "iPhone 16 Pro"     # optional pin
 # os_version: "iOS 26.2"
+# launch_vars: [...]                # each passed to `revyl device start --launch-var`
 
 frame:
   style: iphone-pro        # iphone-pro | iphone | android
   color: black             # black | graphite | silver | white
   background: light        # light | dark | midnight | white | transparent | "#rrggbb"
+                           # or a vertical gradient: { gradient: ["#top", "#bottom"] }
   shadow: true
+  buttons: true            # draw the side buttons
   width: 440               # rendered screen width in px
 
 output:
@@ -141,9 +144,12 @@ output:
   xfade: 0.45              # crossfade seconds between states
   loop: true               # seamless wrap from last state → first
   pingpong: false          # play forward then back instead of wrapping
+  matte: "#ffffff"         # GIF/MP4 have no alpha channel, so a transparent
+                           # background is flattened onto this color
 
 capture:
   initial: true            # capture the opening state before step 1
+  launch_settle: 2.5       # seconds to wait after the device is ready before that first capture
   settle: 0.6              # seconds to wait after each action before screenshotting
   dedup: true              # merge identical consecutive states into one longer hold
   dedup_threshold: 2.0     # how alike two screens must be to merge (mean per-channel
